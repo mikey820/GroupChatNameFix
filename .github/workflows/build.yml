@@ -34,12 +34,11 @@ jobs:
       - name: Install toolchain (Linux ARM)
         run: |
           export THEOS=$HOME/theos
-          curl -L https://github.com/L1ghtmann/llvm-project/releases/latest/download/iOSToolchain.tar.lzma -o /tmp/toolchain.tar.lzma || true
-          if [ -s /tmp/toolchain.tar.lzma ]; then
-            mkdir -p $THEOS/toolchain
-            tar --lzma -xf /tmp/toolchain.tar.lzma -C $THEOS/toolchain || true
-            ls $THEOS/toolchain
-          fi
+          mkdir -p $THEOS/toolchain
+          curl -fL https://github.com/L1ghtmann/llvm-project/releases/latest/download/iOSToolchain.tar.xz -o /tmp/toolchain.tar.xz
+          tar -xf /tmp/toolchain.tar.xz -C $THEOS/toolchain
+          echo "=== toolchain root ==="; ls -la $THEOS/toolchain
+          echo "=== clang location ==="; find $THEOS/toolchain -name clang -type f 2>/dev/null | head
 
       - name: Build tweak
         run: |
