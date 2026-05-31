@@ -1,0 +1,68 @@
+name: Build GroupChatNameFix (rootful, iOS 6 armv7)
+
+on:
+  push:
+    branches: [ main, master ]
+    tags: [ 'v*' ]
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install build deps
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y build-essential fakeroot git perl libtinfo5 || true
+          sudo apt-get install -y dpkg-dev || true
+
+      - name: Setup Theos
+        run: |
+          export THEOS=$HOME/theos
+          echo "THEOS=$THEOS" >> $GITHUB_ENV
+          git clone --recursive https://github.com/theos/theos.git $THEOS
+          curl -L https://github.com/theos/sdks/archive/refs/heads/master.tar.gz -o /tmp/sdks.tar.gz
+          mkdir -p $THEOS/sdks
+          tar -xf /tmp/sdks.tar.gz -C $THEOS/sdks --strip-components=1 sdks-master/iPhoneOS9.3.sdk
+          ls $THEOS/sdks
+
+      - name: Install toolchain (Linux ARM)
+        run: |
+          export THEOS=$HOME/theos
+          curl -L https://github.com/L1ghtmann/llvm-project/releases/latest/download/iOSToolchain.tar.lzma -o /tmp/toolchain.tar.lzma || true
+          if [ -s /tmp/toolchain.tar.lzma ]; then
+            mkdir -p $THEOS/toolchain
+            tar --lzma -xf /tmp/toolchain.tar.lzma -C $THEOS/toolchain || true
+            ls $THEOS/toolchain
+          fi
+
+      - name: Build tweak
+        run: |
+          export THEOS=$HOME/theos
+          make -C rootful clean || true
+          make -C rootful package FINALPACKAGE=1 THEOS_PACKAGE_SCHEME=rootful
+
+      - name: Collect artifacts
+        run: |
+          mkdir -p artifacts
+          cp rootful/packages/*.deb artifacts/ 2>/dev/null || true
+          cp rootful/*.deb artifacts/ 2>/dev/null || true
+          ls -la artifacts/
+
+      - name: Upload artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: GroupChatNameFix-rootful
+          path: artifacts/*
+
+      - name: Release
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: v${{ github.run_number }}
+          files: artifacts/*
+          generate_release_notes: true
