@@ -38,9 +38,12 @@
 // follow-up build if the candidates do not line up.
 
 #import <Foundation/Foundation.h>
-#import <substrate.h>
 #import <objc/message.h>
 #import <objc/runtime.h>
+
+// substrate.h is not bundled with theos; theos auto-links the substrate symbol
+// for tweaks, so we only need to declare the one function we call.
+extern void MSHookMessageEx(Class cls, SEL sel, IMP imp, IMP *result);
 
 static NSString *const kPrefPath = @"/var/mobile/Library/Preferences/com.mikey820.groupchatnamefix.plist";
 static NSString *const kLogPath  = @"/var/mobile/GroupChatNameFix.log";
