@@ -79,6 +79,21 @@ static NSString *GCMsgRoom(id msg) {
     return GCStr(((id(*)(id, SEL))objc_msgSend)(msg, @selector(roomName)));
 }
 
+// Dump the full wire dictionary of an FZMessage so we can see the group-identity
+// fields that actually thread the conversation.
+static void GCDumpMsgDict(id msg, const char *where) {
+    @try {
+        id dict = nil;
+        if ([msg respondsToSelector:@selector(dictionaryRepresentation)])
+            dict = ((id(*)(id, SEL))objc_msgSend)(msg, @selector(dictionaryRepresentation));
+        else if ([msg respondsToSelector:@selector(copyDictionaryRepresentation)])
+            dict = ((id(*)(id, SEL))objc_msgSend)(msg, @selector(copyDictionaryRepresentation));
+        GCLOGB(@"DICT[%s] keys=%@ :: %@", where,
+               [dict isKindOfClass:[NSDictionary class]] ? [[dict allKeys] componentsJoinedByString:@","] : @"?",
+               dict);
+    } @catch (__unused id e) {}
+}
+
 // The actual fix: ensure an outgoing group FZMessage carries its room id.
 static void GCStampOutgoing(id msg, id chat, const char *where) {
     @try {
@@ -86,7 +101,9 @@ static void GCStampOutgoing(id msg, id chat, const char *where) {
         if (!room) return;                                   // not a group room
         if (![msg respondsToSelector:@selector(setRoomName:)]) return;
         if (GCMsgRoom(msg)) return;                          // already has one
+        GCDumpMsgDict(msg, "out-before");
         ((void(*)(id, SEL, id))objc_msgSend)(msg, @selector(setRoomName:), room);
+        GCDumpMsgDict(msg, "out-after");
         GCLOGB(@"FIX[%s] stamped roomName=%@ (was empty) guid=%@",
                where, room, [msg respondsToSelector:@selector(guid)]
                    ? ((id(*)(id, SEL))objc_msgSend)(msg, @selector(guid)) : @"?");
@@ -113,8 +130,10 @@ static void gc_procSend(id self, SEL _cmd, id msg, id chat, int style, id block)
 // ===========================================================================
 static void (*orig_didRecv)(id, SEL, id, id, int);
 static void gc_didRecv(id self, SEL _cmd, id msg, id chat, int style) {
-    @try { GCLOGB(@"recv forChat=%@ msgRoom=%@", GCStr(chat), GCMsgRoom(msg)); }
-    @catch (__unused id e) {}
+    @try {
+        GCLOGB(@"recv forChat=%@ msgRoom=%@", GCStr(chat), GCMsgRoom(msg));
+        GCDumpMsgDict(msg, "in");
+    } @catch (__unused id e) {}
     orig_didRecv(self, _cmd, msg, chat, style);
 }
 
@@ -134,7 +153,7 @@ static BOOL GCHook1(NSString *cn, SEL sel, IMP repl, void *slot, const char *tag
 
 %ctor {
     @autoreleasepool {
-        GCLog(@"=== GroupChatNameFix 3.0.0 loaded in %@ ===",
+        GCLog(@"=== GroupChatNameFix 3.1.0-diag loaded in %@ ===",
               [[NSProcessInfo processInfo] processName]);
         NSString *S = @"IMDServiceSession";
         GCHook1(S, @selector(sendMessage:toChat:style:),
