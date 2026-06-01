@@ -18,7 +18,7 @@ jobs:
       - name: Install build deps
         run: |
           sudo apt-get update
-          sudo apt-get install -y build-essential fakeroot git perl libtinfo5 || true
+          sudo apt-get install -y build-essential fakeroot git perl libtinfo6 || true
           sudo apt-get install -y dpkg-dev || true
 
       - name: Setup Theos
@@ -35,7 +35,7 @@ jobs:
         run: |
           export THEOS=$HOME/theos
           mkdir -p $THEOS/toolchain
-          curl -fL https://github.com/L1ghtmann/llvm-project/releases/latest/download/iOSToolchain.tar.xz -o /tmp/toolchain.tar.xz
+          curl -fL https://github.com/L1ghtmann/llvm-project/releases/download/v19.0.0-L2/llvm-19.0.0-L2-x86_64.tar.xz -o /tmp/toolchain.tar.xz
           tar -xf /tmp/toolchain.tar.xz -C $THEOS/toolchain
           echo "=== toolchain root ==="; ls -la $THEOS/toolchain
           echo "=== clang location ==="; find $THEOS/toolchain -name clang -type f 2>/dev/null | head
