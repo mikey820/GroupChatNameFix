@@ -1,16 +1,26 @@
 // GroupChatNameFix - iOS 6 (armv7) tweak for /usr/libexec/imagent
 //
-// v5.0.0-safehunt : STRICTLY READ-ONLY diagnostic.
-// -------------------------------------------------
-// Earlier builds mutated the live IMDChat (addParticipants:) and KVC-probed
-// objects with -valueForKey:. On incoming CONTROL messages that path caused
-// EXC_BAD_ACCESS inside our dylib and crash-looped imagent (no send/receive).
+// v5.1.0-safehunt : CONTROL-PLANE-ONLY read-only diagnostic.
+// ----------------------------------------------------------
+// Why v5.0.0 still crashed: its didReceiveMessage:forChat:style: hook fired on
+// EVERY incoming message and sent objc_msgSend (respondsToSelector:) to the
+// `msg` argument. Crash report (imagent 2026-06-01 15:51:53) shows frame0 =
+// libobjc objc_msgSend called DIRECTLY from our dylib, on the IMDaemonCore ->
+// iMessage -> libdispatch incoming path, with a garbage stack-address receiver
+// (isa read as 0x22) -> EXC_BAD_ACCESS. So the per-message receive hook gets a
+// non-object on some control traffic and faults. Because it fires on every
+// message, that fault takes down ALL messaging.
 //
-// This build does NOTHING but log, using only proven-safe calls:
-//   * -description                       (every NSObject responds)
-//   * -dictionaryRepresentation          (guarded by respondsToSelector:)
-//   * known IMDServiceSession selectors   (guarded)
-// No -valueForKey:. No object mutation. So it cannot destabilise imagent.
+// This build REMOVES both per-message hooks (didReceiveMessage + sendMessage).
+// It keeps ONLY the rare-firing, read-only control-plane selectors that carry
+// the group-rename / room-mapping event:
+//   renameGroup:to:, changeGroup:changes:, changeGroups:,
+//   _mapRoomChatToGroupChat:style:, useChatRoom:forGroupChatIdentifier:
+// These fire only on group-metadata changes, never on normal traffic, so even
+// in the worst case they cannot break ordinary sending/receiving.
+//
+// Logging uses only proven-safe calls (-description, guarded
+// -dictionaryRepresentation). No -valueForKey:, no mutation.
 //
 // Goal: capture the group RENAME event coming from a modern-iOS device, to see
 // whether iOS 6 ever receives a persistent group GUID it could re-transmit. If
@@ -62,26 +72,6 @@ static id GCDict(id o) {
 }
 
 // ===========================================================================
-// RECEIVE — capture control (no-body) messages; that's where a rename lands.
-// ===========================================================================
-static void (*orig_didRecv)(id, SEL, id, id, int);
-static void gc_didRecv(id self, SEL _cmd, id msg, id chat, int style) {
-    @try {
-        id d = GCDict(msg);
-        BOOL hasBody = [d isKindOfClass:[NSDictionary class]] && (d[@"bodyData"] || d[@"plainBody"]);
-        id flags = [d isKindOfClass:[NSDictionary class]] ? d[@"flags"] : nil;
-        if (!hasBody) {
-            // Control traffic (group updates, renames, participant changes).
-            GCLOGB(@"*** RECV-CONTROL chat=%@ style=%d flags=%@ dict=%@",
-                   GCDesc(chat), style, flags, GCDesc(d));
-        } else {
-            GCLOGB(@"recv chat=%@ flags=%@ (body)", GCDesc(chat), flags);
-        }
-    } @catch (__unused id e) {}
-    orig_didRecv(self, _cmd, msg, chat, style);
-}
-
-// ===========================================================================
 // RENAME / GROUP-CHANGE hooks — the heart of the hunt (read-only).
 // ===========================================================================
 static void (*orig_renameGroup)(id, SEL, id, id);
@@ -123,16 +113,6 @@ static void gc_useRoom(id self, SEL _cmd, id room, id groupId) {
     orig_useRoom(self, _cmd, room, groupId);
 }
 
-// ===========================================================================
-// SEND — observe only (no stamping, no repair).
-// ===========================================================================
-static void (*orig_sendToChatID)(id, SEL, id, id, id, int);
-static void gc_sendToChatID(id self, SEL _cmd, id msg, id chatID, id identifier, int style) {
-    @try { GCLOGB(@"SEND toChatID=%@ identifier=%@ style=%d", GCDesc(chatID), GCDesc(identifier), style); }
-    @catch (__unused id e) {}
-    orig_sendToChatID(self, _cmd, msg, chatID, identifier, style);
-}
-
 // ---------------------------------------------------------------------------
 static BOOL GCHook1(NSString *cn, SEL sel, IMP repl, void *slot, const char *tag) {
     Class c = NSClassFromString(cn);
@@ -147,11 +127,9 @@ static BOOL GCHook1(NSString *cn, SEL sel, IMP repl, void *slot, const char *tag
 
 %ctor {
     @autoreleasepool {
-        GCLog(@"=== GroupChatNameFix 5.0.0-safehunt (READ-ONLY) loaded in %@ ===",
+        GCLog(@"=== GroupChatNameFix 5.1.0-safehunt (CONTROL-PLANE-ONLY) loaded in %@ ===",
               [[NSProcessInfo processInfo] processName]);
         NSString *S = @"IMDServiceSession";
-        GCHook1(S, @selector(didReceiveMessage:forChat:style:),
-                (IMP)gc_didRecv, &orig_didRecv, "recv");
         GCHook1(S, @selector(renameGroup:to:),
                 (IMP)gc_renameGroup, &orig_renameGroup, "rename");
         GCHook1(S, @selector(changeGroup:changes:),
@@ -162,7 +140,5 @@ static BOOL GCHook1(NSString *cn, SEL sel, IMP repl, void *slot, const char *tag
                 (IMP)gc_mapRoom, &orig_mapRoom, "maproom");
         GCHook1(S, @selector(useChatRoom:forGroupChatIdentifier:),
                 (IMP)gc_useRoom, &orig_useRoom, "useroom");
-        GCHook1(S, @selector(sendMessage:toChatID:identifier:style:),
-                (IMP)gc_sendToChatID, &orig_sendToChatID, "send");
     }
 }
