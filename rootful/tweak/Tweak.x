@@ -1,7 +1,14 @@
 // GroupChatNameFix - iOS 6 (armv7) tweak for /usr/libexec/imagent
 //
-// v5.2.0-safehunt : CRASH-PROOF introspection of the rename/room control plane.
+// v5.2.1-safehunt : CRASH-PROOF introspection of the rename/room control plane.
 // -----------------------------------------------------------------------------
+// v5.2.0 still crashed (fault @0x22, same incoming path) even though logging was
+// vm_read-guarded -- because the hook params/return were typed `id`, and ARC
+// auto-emits objc_retain/objc_release on `id` values. That retain/release is
+// itself an isa deref, and it ran on a non-object BEFORE our guarded logging.
+// Fix: type every object arg + captured return as `void *` so ARC never touches
+// them; only __bridge to id after GCIsObjectPtr confirms a real registered obj.
+//
 // Hard lesson from v5.0.0 and v5.1.0 (both crash-looped imagent and broke all
 // messaging): on iOS 6 the arguments handed to IMDServiceSession / IMDaemonCore
 // internal selectors are FREQUENTLY NOT Objective-C objects. They are C structs
@@ -105,12 +112,14 @@ static BOOL GCIsObjectPtr(const void *p) {
     return GCIsRegisteredClass(c);
 }
 
-// Safe printable description of ANYTHING: real objects -> -description; other
-// pointers -> first bytes as ascii+hex; unreadable -> just the pointer.
-static NSString *GCSafe(id o) {
-    const void *p = (__bridge const void *)o;
+// Safe printable description of ANYTHING. Takes a RAW pointer so ARC never
+// emits retain/release on a value that might not be an object (that auto-ARC
+// memory management is itself an isa deref and crashed v5.2.0-rc1). We only
+// bridge to `id` AFTER GCIsObjectPtr confirms it is a registered object.
+static NSString *GCSafe(const void *p) {
     if (!p) return @"(nil)";
     if (GCIsObjectPtr(p)) {
+        id o = (__bridge id)p;
         @try { return [o description] ?: @"(nil-desc)"; }
         @catch (__unused id e) { return @"(desc-threw)"; }
     }
@@ -129,13 +138,14 @@ static NSString *GCSafe(id o) {
     return [NSString stringWithFormat:@"<unreadable %p>", p];
 }
 
-// dictionaryRepresentation, but only if `o` is a verified object that responds.
-static NSString *GCDict(id o) {
-    if (!GCIsObjectPtr((__bridge const void *)o)) return @"(not-obj)";
+// dictionaryRepresentation, but only if `p` is a verified object that responds.
+static NSString *GCDict(const void *p) {
+    if (!GCIsObjectPtr(p)) return @"(not-obj)";
+    id o = (__bridge id)p;
     @try {
         if ([o respondsToSelector:@selector(dictionaryRepresentation)]) {
             id d = ((id(*)(id, SEL))objc_msgSend)(o, @selector(dictionaryRepresentation));
-            return GCSafe(d);
+            return GCSafe((__bridge const void *)d);
         }
     } @catch (__unused id e) {}
     return @"(no-dict)";
@@ -144,38 +154,40 @@ static NSString *GCDict(id o) {
 // ===========================================================================
 // RENAME / GROUP-CHANGE / ROOM-MAPPING hooks — read-only, fully guarded.
 // ===========================================================================
-static void (*orig_renameGroup)(id, SEL, id, id);
-static void gc_renameGroup(id self, SEL _cmd, id group, id name) {
+// NOTE: every object argument and the captured return are typed `void *`, never
+// `id`, so ARC cannot emit retain/release (= isa deref) on a possible non-object.
+static void (*orig_renameGroup)(id, SEL, void *, void *);
+static void gc_renameGroup(id self, SEL _cmd, void *group, void *name) {
     @try { GCLOGB(@"*** RENAME group=%@ to=%@ dict=%@", GCSafe(group), GCSafe(name), GCDict(group)); }
     @catch (__unused id e) {}
     orig_renameGroup(self, _cmd, group, name);
 }
 
-static void (*orig_changeGroup)(id, SEL, id, id);
-static void gc_changeGroup(id self, SEL _cmd, id group, id changes) {
+static void (*orig_changeGroup)(id, SEL, void *, void *);
+static void gc_changeGroup(id self, SEL _cmd, void *group, void *changes) {
     @try { GCLOGB(@"*** CHANGEGROUP group=%@ changes=%@", GCSafe(group), GCSafe(changes)); }
     @catch (__unused id e) {}
     orig_changeGroup(self, _cmd, group, changes);
 }
 
-static void (*orig_changeGroups)(id, SEL, id);
-static void gc_changeGroups(id self, SEL _cmd, id groups) {
+static void (*orig_changeGroups)(id, SEL, void *);
+static void gc_changeGroups(id self, SEL _cmd, void *groups) {
     @try { GCLOGB(@"*** CHANGEGROUPS %@", GCSafe(groups)); }
     @catch (__unused id e) {}
     orig_changeGroups(self, _cmd, groups);
 }
 
-static id (*orig_mapRoom)(id, SEL, id, int);
-static id gc_mapRoom(id self, SEL _cmd, id room, int style) {
-    id r = orig_mapRoom(self, _cmd, room, style);
+static void * (*orig_mapRoom)(id, SEL, void *, int);
+static void * gc_mapRoom(id self, SEL _cmd, void *room, int style) {
+    void *r = orig_mapRoom(self, _cmd, room, style);
     @try { GCLOGB(@"MAPROOM room=%@ style=%d => %@", GCSafe(room), style, GCSafe(r)); }
     @catch (__unused id e) {}
     return r;
 }
 
 // useChatRoom:forGroupChatIdentifier: establishes the room<->group link on rename.
-static void (*orig_useRoom)(id, SEL, id, id);
-static void gc_useRoom(id self, SEL _cmd, id room, id groupId) {
+static void (*orig_useRoom)(id, SEL, void *, void *);
+static void gc_useRoom(id self, SEL _cmd, void *room, void *groupId) {
     @try { GCLOGB(@"*** USEROOM room=%@ forGroupChatIdentifier=%@", GCSafe(room), GCSafe(groupId)); }
     @catch (__unused id e) {}
     orig_useRoom(self, _cmd, room, groupId);
@@ -196,7 +208,7 @@ static BOOL GCHook1(NSString *cn, SEL sel, IMP repl, void *slot, const char *tag
 %ctor {
     @autoreleasepool {
         GCBuildClassList();
-        GCLog(@"=== GroupChatNameFix 5.2.0-safehunt (vm_read-guarded) loaded in %@ (classes=%d) ===",
+        GCLog(@"=== GroupChatNameFix 5.2.1-safehunt (vm_read-guarded, void* args) loaded in %@ (classes=%d) ===",
               [[NSProcessInfo processInfo] processName], gClassCount);
         NSString *S = @"IMDServiceSession";
         GCHook1(S, @selector(renameGroup:to:),
