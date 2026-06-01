@@ -1,6 +1,16 @@
 // GroupChatNameFix - iOS 6 (armv7) tweak for /usr/libexec/imagent
 //
-// v5.3.0-safehunt : probe the incoming-message IMDChat + outgoing send identity.
+// v5.4.0-FIX : strip the stale roomName on outgoing GROUP sends.
+// -----------------------------------------------------------------------------
+// MECHANISM PROVEN (v5.3.x): renaming a group that contains a legacy iOS6 device
+// migrates the modern group to a NEW room id; iOS6 is never notified and keeps
+// sending with the OLD roomName (chatXXXX), so modern devices fork those into a
+// separate convo. The new room id never reaches iOS6, so iOS6 cannot rejoin by
+// learning it. ONLY fix path that doesn't need the new room: drop the stale room
+// tag on iOS6's outgoing group messages so modern re-threads by participant set.
+// This build does that (style 43 only), leaving the local `chat` arg intact so
+// iOS6's own thread is unaffected. EXPERIMENT: verify on the different-number
+// recipient that iOS6's messages now land in the renamed group.
 // -----------------------------------------------------------------------------
 // Finding from v5.2.1: when a modern device renames the group, iOS 6 fires NONE
 // of renameGroup/changeGroup/changeGroups/useChatRoom. Only the per-message
@@ -209,13 +219,36 @@ static void gc_didRecv(id self, SEL _cmd, void *msg, void *chat, int style) {
     orig_didRecv(self, _cmd, msg, chat, style);
 }
 
-// SEND — what identity does iOS 6 stamp on an outgoing group message? That is
-// what modern recipients fail to thread back into the renamed group.
+// SEND — THE FIX. On a group send (style 43) the outgoing FZMessage carries a
+// stale roomName (the pre-rename room). Modern devices migrated to a new room on
+// rename and reject the stale one into a fork. We CLEAR the roomName on the
+// outgoing message so the wire payload is participant-keyed; modern then threads
+// it by participant set into the renamed group. iOS 6's own local thread is keyed
+// by the `chat` arg (left untouched), so iOS 6's view is unaffected.
+static BOOL gFixEnabled = YES;          // master switch (read-only if NO)
 static void (*orig_sendMsg)(id, SEL, void *, void *, int);
 static void gc_sendMsg(id self, SEL _cmd, void *msg, void *chat, int style) {
     @try {
-        GCLOGB(@"SEND style=%d chat<%@>=%@\n    chat.probe=%@\n    msg.dict=%@",
-               style, GCClass(chat), GCSafe(chat), GCProbe(chat), GCDict(msg));
+        BOOL isGroup = (style == 43);
+        id oldRoom = nil;
+        if (gFixEnabled && isGroup && GCIsObjectPtr(msg)) {
+            id m = (__bridge id)msg;
+            if ([m respondsToSelector:@selector(roomName)] &&
+                [m respondsToSelector:@selector(setRoomName:)]) {
+                oldRoom = ((id(*)(id, SEL))objc_msgSend)(m, @selector(roomName));
+                // Only strip a real stale room ("chatXXXX"); never touch nil.
+                if (GCIsObjectPtr((__bridge const void *)oldRoom)) {
+                    ((void(*)(id, SEL, id))objc_msgSend)(m, @selector(setRoomName:), nil);
+                    GCLOGB(@"SEND-FIX style=%d strippedRoom=%@ chat<%@>=%@",
+                           style, GCSafe((__bridge const void *)oldRoom),
+                           GCClass(chat), GCSafe(chat));
+                }
+            }
+        }
+        if (!oldRoom) {
+            GCLOGB(@"SEND style=%d chat<%@>=%@ msg.dict=%@",
+                   style, GCClass(chat), GCSafe(chat), GCDict(msg));
+        }
     } @catch (__unused id e) {}
     orig_sendMsg(self, _cmd, msg, chat, style);
 }
@@ -252,7 +285,7 @@ static BOOL GCHook1(NSString *cn, SEL sel, IMP repl, void *slot, const char *tag
 %ctor {
     @autoreleasepool {
         GCBuildClassList();
-        GCLog(@"=== GroupChatNameFix 5.3.1-safehunt (chat class+desc, msg.dict) loaded in %@ (classes=%d) ===",
+        GCLog(@"=== GroupChatNameFix 5.4.0-FIX (strip stale roomName on group send) loaded in %@ (classes=%d) ===",
               [[NSProcessInfo processInfo] processName], gClassCount);
         NSString *S = @"IMDServiceSession";
         GCHook1(S, @selector(didReceiveMessage:forChat:style:),
