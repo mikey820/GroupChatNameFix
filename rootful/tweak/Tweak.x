@@ -35,6 +35,10 @@
 
 extern void MSHookMessageEx(Class cls, SEL sel, IMP imp, IMP *result);
 
+// forward decls (defined further down, used earlier in the send probe)
+static void GCProbeGUIDKeys(id obj, const char *what);
+static void GCDumpAllMethodsOnce(id obj, const char *tag);
+
 static NSString *const kLogPath = @"/var/mobile/GroupChatNameFix.log";
 static NSString *const kRosterPath = @"/var/mobile/Library/Preferences/com.mikey820.groupchatnamefix.roster.plist";
 static int gLogBudget = 800;   // keep the log bounded
