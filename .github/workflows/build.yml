@@ -44,7 +44,7 @@ jobs:
         run: |
           export THEOS=$HOME/theos
           make -C rootful clean || true
-          make -C rootful package FINALPACKAGE=1 THEOS_PACKAGE_SCHEME=rootful
+          make -C rootful package FINALPACKAGE=1
 
       - name: Collect artifacts
         run: |
