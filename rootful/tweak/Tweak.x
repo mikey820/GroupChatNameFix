@@ -225,7 +225,7 @@ static void gc_didRecv(id self, SEL _cmd, void *msg, void *chat, int style) {
 // outgoing message so the wire payload is participant-keyed; modern then threads
 // it by participant set into the renamed group. iOS 6's own local thread is keyed
 // by the `chat` arg (left untouched), so iOS 6's view is unaffected.
-static BOOL gFixEnabled = YES;          // master switch (read-only if NO)
+static BOOL gFixEnabled = NO;           // room-strip disabled (proven insufficient); observe only
 static void (*orig_sendMsg)(id, SEL, void *, void *, int);
 static void gc_sendMsg(id self, SEL _cmd, void *msg, void *chat, int style) {
     @try {
@@ -271,6 +271,35 @@ static void gc_useRoom(id self, SEL _cmd, void *room, void *groupId) {
 }
 
 // ---------------------------------------------------------------------------
+// Enumerate the WHOLE runtime for methods that look like a raw incoming-message
+// handler (the upstream point that still holds the wire dictionary, where a
+// renamed group's new room id would live if it reaches iOS 6 at all).
+static void GCHuntIncoming(void) {
+    int n = objc_getClassList(NULL, 0);
+    if (n <= 0) return;
+    Class *cls = (Class *)malloc(sizeof(Class) * n);
+    if (!cls) return;
+    n = objc_getClassList(cls, n);
+    int hits = 0;
+    for (int i = 0; i < n; i++) {
+        unsigned int mc = 0;
+        Method *ms = class_copyMethodList(cls[i], &mc);
+        for (unsigned int j = 0; j < mc; j++) {
+            const char *nm = sel_getName(method_getName(ms[j]));
+            if (strstr(nm, "ncomingMessage") || strstr(nm, "essageReceived") ||
+                strstr(nm, "ushedMessage")   || strstr(nm, "ncomingTopic")  ||
+                strstr(nm, "essage:fromID")  || strstr(nm, "rocessIncoming")||
+                strstr(nm, "eceivedMessage") || strstr(nm, "essage:forTopic")) {
+                GCLOGB(@"  INMETH %s :: %s", class_getName(cls[i]), nm);
+                hits++;
+            }
+        }
+        if (ms) free(ms);
+    }
+    free(cls);
+    GCLog(@"INMETH hunt done (%d hits)", hits);
+}
+
 static BOOL GCHook1(NSString *cn, SEL sel, IMP repl, void *slot, const char *tag) {
     Class c = NSClassFromString(cn);
     if (c && [c instancesRespondToSelector:sel]) {
@@ -285,8 +314,9 @@ static BOOL GCHook1(NSString *cn, SEL sel, IMP repl, void *slot, const char *tag
 %ctor {
     @autoreleasepool {
         GCBuildClassList();
-        GCLog(@"=== GroupChatNameFix 5.4.0-FIX (strip stale roomName on group send) loaded in %@ (classes=%d) ===",
+        GCLog(@"=== GroupChatNameFix 5.5.0-hunt (raw inbound handler enum) loaded in %@ (classes=%d) ===",
               [[NSProcessInfo processInfo] processName], gClassCount);
+        GCHuntIncoming();
         NSString *S = @"IMDServiceSession";
         GCHook1(S, @selector(didReceiveMessage:forChat:style:),
                 (IMP)gc_didRecv, &orig_didRecv, "recv");
