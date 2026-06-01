@@ -36,7 +36,13 @@
 extern void MSHookMessageEx(Class cls, SEL sel, IMP imp, IMP *result);
 
 static NSString *const kLogPath = @"/var/mobile/GroupChatNameFix.log";
-static int gLogBudget = 600;   // keep the log bounded
+static NSString *const kRosterPath = @"/var/mobile/Library/Preferences/com.mikey820.groupchatnamefix.roster.plist";
+static int gLogBudget = 800;   // keep the log bounded
+
+// room id -> NSMutableArray of handle strings (the TRUE roster, accumulated
+// from every participant + sender ever seen on that room). Persisted.
+static NSMutableDictionary *gRoster;
+static NSMutableSet *gDumpedClasses;
 
 // ---------------------------------------------------------------------------
 // Logging
@@ -77,6 +83,74 @@ static NSString *GCRoomFromChatArg(id chat) {
 static NSString *GCMsgRoom(id msg) {
     if (![msg respondsToSelector:@selector(roomName)]) return nil;
     return GCStr(((id(*)(id, SEL))objc_msgSend)(msg, @selector(roomName)));
+}
+
+// FZPersonID from an FZMessage's senderInfo (a confirmed group member).
+static NSString *GCMsgSender(id msg) {
+    @try {
+        id dict = nil;
+        if ([msg respondsToSelector:@selector(dictionaryRepresentation)])
+            dict = ((id(*)(id, SEL))objc_msgSend)(msg, @selector(dictionaryRepresentation));
+        if ([dict isKindOfClass:[NSDictionary class]]) {
+            id si = dict[@"senderInfo"];
+            if ([si isKindOfClass:[NSDictionary class]]) return GCStr(si[@"FZPersonID"]);
+        }
+    } @catch (__unused id e) {}
+    return nil;
+}
+
+// ---------------------------------------------------------------------------
+// True-roster accumulation (persisted)
+// ---------------------------------------------------------------------------
+static void GCRosterLoad(void) {
+    NSDictionary *d = [NSDictionary dictionaryWithContentsOfFile:kRosterPath];
+    gRoster = [NSMutableDictionary dictionary];
+    for (NSString *k in d) gRoster[k] = [d[k] mutableCopy];
+}
+static void GCRosterSave(void) {
+    @try { [gRoster writeToFile:kRosterPath atomically:YES]; } @catch (__unused id e) {}
+}
+// add one handle to a room's accumulated roster; returns YES if it was new.
+static BOOL GCRosterAdd(NSString *room, NSString *handle) {
+    if (!room || !handle) return NO;
+    NSMutableArray *list = gRoster[room];
+    if (!list) { list = [NSMutableArray array]; gRoster[room] = list; }
+    if ([list containsObject:handle]) return NO;
+    [list addObject:handle];
+    GCRosterSave();
+    GCLOGB(@"ROSTER %@ += %@  (now %u)", room, handle, (unsigned)list.count);
+    return YES;
+}
+
+// Dump participant-mutation selectors of an IMDChat once, so we can pin the
+// repair API in the next build.
+static void GCDumpChatMethods(id chat) {
+    if (!chat) return;
+    Class c = object_getClass(chat);
+    NSString *cn = NSStringFromClass(c);
+    @synchronized (gDumpedClasses) {
+        if ([gDumpedClasses containsObject:cn]) return;
+        [gDumpedClasses addObject:cn];
+    }
+    NSMutableArray *hits = [NSMutableArray array];
+    Class cur = c; int depth = 0;
+    while (cur && depth < 4) {
+        unsigned int n = 0; Method *ms = class_copyMethodList(cur, &n);
+        for (unsigned i = 0; i < n; i++) {
+            NSString *s = NSStringFromSelector(method_getName(ms[i]));
+            NSString *l = [s lowercaseString];
+            if ([l rangeOfString:@"particip"].location != NSNotFound ||
+                [l rangeOfString:@"handle"].location != NSNotFound ||
+                [l rangeOfString:@"member"].location != NSNotFound ||
+                [l rangeOfString:@"recipient"].location != NSNotFound ||
+                [l rangeOfString:@"addr"].location != NSNotFound ||
+                [l rangeOfString:@"setroom"].location != NSNotFound) {
+                [hits addObject:s];
+            }
+        }
+        free(ms); cur = class_getSuperclass(cur); depth++;
+    }
+    GCLOGB(@"CHATMETHODS %@ : %@", cn, [hits componentsJoinedByString:@", "]);
 }
 
 // Dump the full wire dictionary of an FZMessage so we can see the group-identity
@@ -138,9 +212,27 @@ static void GCProbeGroup(id session, NSString *room, const char *where) {
                                    [NSString stringWithFormat:@"iMessage;-;%@", room] ]) {
                 id ch = ((id(*)(id, SEL, id))objc_msgSend)(shared, @selector(existingChatWithGUID:), g);
                 if (ch) {
-                    id d = [ch respondsToSelector:@selector(dictionaryRepresentation)]
-                        ? ((id(*)(id, SEL))objc_msgSend)(ch, @selector(dictionaryRepresentation)) : nil;
-                    GCLOGB(@"PROBE[%s] chatWithGUID(%@) = %@ :: dict=%@", where, g, ch, d);
+                    GCDumpChatMethods(ch);
+                    // pull this chat's known participants (FZPersonID strings) into the roster
+                    id parts = [ch respondsToSelector:@selector(participants)]
+                        ? ((id(*)(id, SEL))objc_msgSend)(ch, @selector(participants)) : nil;
+                    NSMutableArray *chatHandles = [NSMutableArray array];
+                    if ([parts isKindOfClass:[NSArray class]]) {
+                        for (id p in (NSArray *)parts) {
+                            NSString *h = nil;
+                            for (NSString *sel in @[ @"ID", @"address", @"identifier" ]) {
+                                SEL s = NSSelectorFromString(sel);
+                                if ([p respondsToSelector:s]) {
+                                    id v = ((id(*)(id, SEL))objc_msgSend)(p, s);
+                                    if ((h = GCStr(v))) break;
+                                }
+                            }
+                            if (h) { [chatHandles addObject:h]; GCRosterAdd(room, h); }
+                        }
+                    }
+                    NSArray *trueRoster = gRoster[room];
+                    GCLOGB(@"PROBE[%s] room=%@  chatParticipants=%@  TRUEroster=%@",
+                           where, room, chatHandles, trueRoster);
                     break;
                 }
             }
@@ -187,8 +279,10 @@ static void gc_procSend(id self, SEL _cmd, id msg, id chat, int style, id block)
 static void (*orig_didRecv)(id, SEL, id, id, int);
 static void gc_didRecv(id self, SEL _cmd, id msg, id chat, int style) {
     @try {
-        GCLOGB(@"recv forChat=%@ msgRoom=%@", GCStr(chat), GCMsgRoom(msg));
-        GCDumpMsgDict(msg, "in");
+        NSString *room = GCRoomFromChatArg(chat);
+        NSString *sender = GCMsgSender(msg);
+        GCLOGB(@"recv forChat=%@ sender=%@", GCStr(chat), sender);
+        if (room && sender) GCRosterAdd(room, sender);   // confirmed group member
     } @catch (__unused id e) {}
     orig_didRecv(self, _cmd, msg, chat, style);
 }
@@ -209,8 +303,10 @@ static BOOL GCHook1(NSString *cn, SEL sel, IMP repl, void *slot, const char *tag
 
 %ctor {
     @autoreleasepool {
-        GCLog(@"=== GroupChatNameFix 3.2.0-diag loaded in %@ ===",
-              [[NSProcessInfo processInfo] processName]);
+        gDumpedClasses = [NSMutableSet set];
+        GCRosterLoad();
+        GCLog(@"=== GroupChatNameFix 3.3.0-diag loaded in %@ (roster rooms=%u) ===",
+              [[NSProcessInfo processInfo] processName], (unsigned)gRoster.count);
         NSString *S = @"IMDServiceSession";
         GCHook1(S, @selector(sendMessage:toChat:style:),
                 (IMP)gc_sendMsg, &orig_sendMsg, "fix-send");
