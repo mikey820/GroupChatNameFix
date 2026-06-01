@@ -186,7 +186,9 @@ static NSString *GCProbe(const void *p) {
     id o = (__bridge id)p;
     static const char *sels[] = {
         "guid", "groupID", "groupChatIdentifier", "roomName", "identifier",
-        "chatIdentifier", "name", "displayName", "service", "participants", NULL
+        "chatIdentifier", "name", "displayName", "service", "participants",
+        "threadIdentifier", "properties", "dictionary", "messageDictionary",
+        "rawDictionary", "originalDictionary", NULL
     };
     NSMutableString *s = [NSMutableString string];
     for (int i = 0; sels[i]; i++) {
@@ -213,8 +215,9 @@ static NSString *GCProbe(const void *p) {
 static void (*orig_didRecv)(id, SEL, void *, void *, int);
 static void gc_didRecv(id self, SEL _cmd, void *msg, void *chat, int style) {
     @try {
-        GCLOGB(@"RECV style=%d chat<%@>=%@\n    chat.probe=%@\n    msg.dict=%@\n    msg=%@",
-               style, GCClass(chat), GCSafe(chat), GCProbe(chat), GCDict(msg), GCSafe(msg));
+        GCLOGB(@"RECV style=%d chat<%@>=%@\n    chat.probe=%@\n    msg<%@>.probe=%@\n    msg.dict=%@",
+               style, GCClass(chat), GCSafe(chat), GCProbe(chat),
+               GCClass(msg), GCProbe(msg), GCDict(msg));
     } @catch (__unused id e) {}
     orig_didRecv(self, _cmd, msg, chat, style);
 }
@@ -274,6 +277,22 @@ static void gc_useRoom(id self, SEL _cmd, void *room, void *groupId) {
 // Enumerate the WHOLE runtime for methods that look like a raw incoming-message
 // handler (the upstream point that still holds the wire dictionary, where a
 // renamed group's new room id would live if it reaches iOS 6 at all).
+// Dump EVERY instance method of a class (and its superclasses up to NSObject).
+static void GCDumpAll(NSString *clsName) {
+    Class c = NSClassFromString(clsName);
+    if (!c) { GCLog(@"DUMPALL no class %@", clsName); return; }
+    for (Class cur = c; cur && cur != [NSObject class]; cur = class_getSuperclass(cur)) {
+        unsigned int mc = 0;
+        Method *ms = class_copyMethodList(cur, &mc);
+        for (unsigned int j = 0; j < mc; j++)
+            GCLOGB(@"  M %s :: %s", class_getName(cur), sel_getName(method_getName(ms[j])));
+        if (ms) free(ms);
+    }
+    GCLog(@"DUMPALL %@ done", clsName);
+}
+
+// Hunt the whole runtime for message<->dictionary parsers (where a raw wire dict
+// with the renamed group's new room id would be handled, if it reaches iOS 6).
 static void GCHuntIncoming(void) {
     int n = objc_getClassList(NULL, 0);
     if (n <= 0) return;
@@ -286,10 +305,12 @@ static void GCHuntIncoming(void) {
         Method *ms = class_copyMethodList(cls[i], &mc);
         for (unsigned int j = 0; j < mc; j++) {
             const char *nm = sel_getName(method_getName(ms[j]));
-            if (strstr(nm, "ncomingMessage") || strstr(nm, "essageReceived") ||
-                strstr(nm, "ushedMessage")   || strstr(nm, "ncomingTopic")  ||
-                strstr(nm, "essage:fromID")  || strstr(nm, "rocessIncoming")||
-                strstr(nm, "eceivedMessage") || strstr(nm, "essage:forTopic")) {
+            if (strstr(nm, "essageWithDictionary") || strstr(nm, "essageForDictionary") ||
+                strstr(nm, "romDictionary")        || strstr(nm, "FromDictionary")      ||
+                strstr(nm, "arseMessage")          || strstr(nm, "ecodeMessage")        ||
+                strstr(nm, "ncomingMessage")       || strstr(nm, "essageReceived")       ||
+                strstr(nm, "eceivedMessage")       || strstr(nm, "rocessMessage")        ||
+                strstr(nm, "andleMessage")         || strstr(nm, "essage:fromID")) {
                 GCLOGB(@"  INMETH %s :: %s", class_getName(cls[i]), nm);
                 hits++;
             }
@@ -314,9 +335,10 @@ static BOOL GCHook1(NSString *cn, SEL sel, IMP repl, void *slot, const char *tag
 %ctor {
     @autoreleasepool {
         GCBuildClassList();
-        GCLog(@"=== GroupChatNameFix 5.5.0-hunt (raw inbound handler enum) loaded in %@ (classes=%d) ===",
+        GCLog(@"=== GroupChatNameFix 5.6.0-hunt (full IMDServiceSession dump + msg probe) loaded in %@ (classes=%d) ===",
               [[NSProcessInfo processInfo] processName], gClassCount);
         GCHuntIncoming();
+        GCDumpAll(@"IMDServiceSession");
         NSString *S = @"IMDServiceSession";
         GCHook1(S, @selector(didReceiveMessage:forChat:style:),
                 (IMP)gc_didRecv, &orig_didRecv, "recv");
