@@ -222,33 +222,33 @@ static void gc_didRecv(id self, SEL _cmd, void *msg, void *chat, int style) {
     orig_didRecv(self, _cmd, msg, chat, style);
 }
 
-// SEND — THE FIX. On a group send (style 43) the outgoing FZMessage carries a
-// stale roomName (the pre-rename room). Modern devices migrated to a new room on
-// rename and reject the stale one into a fork. We CLEAR the roomName on the
-// outgoing message so the wire payload is participant-keyed; modern then threads
-// it by participant set into the renamed group. iOS 6's own local thread is keyed
-// by the `chat` arg (left untouched), so iOS 6's view is unaffected.
-static BOOL gFixEnabled = NO;           // room-strip disabled (proven insufficient); observe only
+// SEND — POC FIX. On a group send (style 43) the outgoing FZMessage carries the
+// STALE pre-rename room. Stripping it (v5.4.0) still forked. This build REMAPS
+// the stale room to the renamed group's CURRENT room (read off the modern device
+// dev35's sms.db). If modern now threads iOS6's messages into the renamed group,
+// the approach works and a live companion-relay version is justified. Targeted
+// by exact stale-room match so OTHER groups are untouched. msg.roomName drives
+// the wire (proven in v5.4.0); local `chat` arg left intact so iOS6's view holds.
+static NSString *const kStaleRoom = @"chat946155922201036467";  // iOS6's pinned old room
+static NSString *const kNewRoom   = @"chat805521337945948089";  // current renamed-group room (dev35)
+static BOOL gRemapEnabled = YES;
 static void (*orig_sendMsg)(id, SEL, void *, void *, int);
 static void gc_sendMsg(id self, SEL _cmd, void *msg, void *chat, int style) {
     @try {
-        BOOL isGroup = (style == 43);
-        id oldRoom = nil;
-        if (gFixEnabled && isGroup && GCIsObjectPtr(msg)) {
+        BOOL remapped = NO;
+        if (gRemapEnabled && style == 43 && GCIsObjectPtr(msg)) {
             id m = (__bridge id)msg;
             if ([m respondsToSelector:@selector(roomName)] &&
                 [m respondsToSelector:@selector(setRoomName:)]) {
-                oldRoom = ((id(*)(id, SEL))objc_msgSend)(m, @selector(roomName));
-                // Only strip a real stale room ("chatXXXX"); never touch nil.
-                if (GCIsObjectPtr((__bridge const void *)oldRoom)) {
-                    ((void(*)(id, SEL, id))objc_msgSend)(m, @selector(setRoomName:), nil);
-                    GCLOGB(@"SEND-FIX style=%d strippedRoom=%@ chat<%@>=%@",
-                           style, GCSafe((__bridge const void *)oldRoom),
-                           GCClass(chat), GCSafe(chat));
+                void *rnp = ((void *(*)(id, SEL))objc_msgSend)(m, @selector(roomName));
+                if (GCIsObjectPtr(rnp) && [kStaleRoom isEqual:(__bridge id)rnp]) {
+                    ((void(*)(id, SEL, id))objc_msgSend)(m, @selector(setRoomName:), kNewRoom);
+                    GCLOGB(@"SEND-REMAP style=%d %@ -> %@", style, kStaleRoom, kNewRoom);
+                    remapped = YES;
                 }
             }
         }
-        if (!oldRoom) {
+        if (!remapped) {
             GCLOGB(@"SEND style=%d chat<%@>=%@ msg.dict=%@",
                    style, GCClass(chat), GCSafe(chat), GCDict(msg));
         }
@@ -352,7 +352,7 @@ static BOOL GCHook1(NSString *cn, SEL sel, IMP repl, void *slot, const char *tag
 %ctor {
     @autoreleasepool {
         GCBuildClassList();
-        GCLog(@"=== GroupChatNameFix 5.7.0-hunt (chat-lifecycle: invite/join/status/register/route) loaded in %@ (classes=%d) ===",
+        GCLog(@"=== GroupChatNameFix 5.8.0-POC (remap stale room -> current renamed room) loaded in %@ (classes=%d) ===",
               [[NSProcessInfo processInfo] processName], gClassCount);
         NSString *S = @"IMDServiceSession";
         GCHook1(S, @selector(didReceiveMessage:forChat:style:),
