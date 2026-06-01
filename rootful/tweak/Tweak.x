@@ -353,38 +353,23 @@ static void gc_routing(id self, SEL _cmd, void *msgGUID, void *chatGUID, void *e
     orig_routing(self, _cmd, msgGUID, chatGUID, err);
 }
 
-// Enumerate the runtime for the raw push-intake entry point (where apsd hands an
-// encrypted push to imagent, BELOW the iMessage logic). If a rename push reaches
-// iOS6 at all, it passes through here before being dropped. We log class::selector
-// for anything push/APS/topic/stream-related so we can hook the real one next.
-static void GCHuntPush(void) {
-    int n = objc_getClassList(NULL, 0);
-    if (n <= 0) return;
-    Class *cls = (Class *)malloc(sizeof(Class) * n);
-    if (!cls) return;
-    n = objc_getClassList(cls, n);
-    int hits = 0;
-    for (int i = 0; i < n; i++) {
-        const char *cn = class_getName(cls[i]);
-        unsigned int mc = 0;
-        Method *ms = class_copyMethodList(cls[i], &mc);
-        for (unsigned int j = 0; j < mc; j++) {
-            const char *nm = sel_getName(method_getName(ms[j]));
-            if (strstr(nm, "didReceiveIncomingMessage") || strstr(nm, "didReceivePush") ||
-                strstr(nm, "ForTopic")        || strstr(nm, "treamMessage")   ||
-                strstr(nm, "ncomingPush")     || strstr(nm, "essageForTopic") ||
-                strstr(nm, "connection:didReceive") || strstr(nm, "Connection:didReceive") ||
-                strstr(nm, "noteReceived")    || strstr(nm, "_handleMessage:") ||
-                strstr(cn, "APSConnection")   || strstr(cn, "APSIncoming") ||
-                strstr(cn, "PushConnection")) {
-                GCLOGB(@"  PMETH %s :: %s", cn, nm);
-                hits++;
-            }
+// RAW PUSH INTAKE — APSConnection _deliverMessage: is the chokepoint every
+// incoming push passes through before any iMessage logic. We dump topic+userInfo
+// so a live rename reveals whether a control push for the renamed group is even
+// delivered to iOS6 (answering: is the rename network request addressed to us?).
+static void (*orig_deliver)(id, SEL, void *);
+static void gc_deliver(id self, SEL _cmd, void *msg) {
+    @try {
+        if (GCIsObjectPtr(msg)) {
+            id m = (__bridge id)msg;
+            void *tp = [m respondsToSelector:@selector(topic)]
+                       ? ((void *(*)(id, SEL))objc_msgSend)(m, @selector(topic)) : NULL;
+            void *ui = [m respondsToSelector:@selector(userInfo)]
+                       ? ((void *(*)(id, SEL))objc_msgSend)(m, @selector(userInfo)) : NULL;
+            GCLOGB(@"PUSH topic=%@\n    userInfo=%@", GCSafe(tp), GCSafe(ui));
         }
-        if (ms) free(ms);
-    }
-    free(cls);
-    GCLog(@"PMETH hunt done (%d hits)", hits);
+    } @catch (__unused id e) {}
+    orig_deliver(self, _cmd, msg);
 }
 
 // ---------------------------------------------------------------------------
@@ -402,9 +387,10 @@ static BOOL GCHook1(NSString *cn, SEL sel, IMP repl, void *slot, const char *tag
 %ctor {
     @autoreleasepool {
         GCBuildClassList();
-        GCLog(@"=== GroupChatNameFix 5.10.0-pushhunt (find raw push intake) loaded in %@ (classes=%d) ===",
+        GCLog(@"=== GroupChatNameFix 5.11.0-pushcap (dump raw APS pushes) loaded in %@ (classes=%d) ===",
               [[NSProcessInfo processInfo] processName], gClassCount);
-        GCHuntPush();
+        GCHook1(@"APSConnection", @selector(_deliverMessage:),
+                (IMP)gc_deliver, &orig_deliver, "push");
         NSString *S = @"IMDServiceSession";
         GCHook1(S, @selector(didReceiveMessage:forChat:style:),
                 (IMP)gc_didRecv, &orig_didRecv, "recv");
