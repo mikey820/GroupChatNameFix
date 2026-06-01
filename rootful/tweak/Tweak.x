@@ -67,48 +67,55 @@ static BOOL GCSafeRead(const void *addr, void *out, size_t len) {
     return (kr == KERN_SUCCESS && got == len);
 }
 
-// Sorted snapshot of every registered Class pointer, for membership testing
-// (pointer compare only -- we never dereference an unverified class).
-static Class *gClasses = NULL;
+// Sorted snapshot of every registered class pointer (as integers, to keep ARC
+// out of it), for membership testing -- pointer compare only, never deref'd.
+static uintptr_t *gClassPtrs = NULL;
 static int gClassCount = 0;
-static int GCClassCmp(const void *a, const void *b) {
-    uintptr_t x = (uintptr_t)*(Class *)a, y = (uintptr_t)*(Class *)b;
+static int GCUIntCmp(const void *a, const void *b) {
+    uintptr_t x = *(const uintptr_t *)a, y = *(const uintptr_t *)b;
     return (x < y) ? -1 : (x > y) ? 1 : 0;
 }
 static void GCBuildClassList(void) {
     int n = objc_getClassList(NULL, 0);
     if (n <= 0) return;
-    gClasses = (Class *)malloc(sizeof(Class) * n);
-    if (!gClasses) return;
-    gClassCount = objc_getClassList(gClasses, n);
-    qsort(gClasses, gClassCount, sizeof(Class), GCClassCmp);
+    Class *tmp = (Class *)malloc(sizeof(Class) * n);
+    if (!tmp) return;
+    gClassCount = objc_getClassList(tmp, n);
+    gClassPtrs = (uintptr_t *)malloc(sizeof(uintptr_t) * gClassCount);
+    if (gClassPtrs)
+        for (int i = 0; i < gClassCount; i++) gClassPtrs[i] = (uintptr_t)tmp[i];
+    free(tmp);
+    if (gClassPtrs) qsort(gClassPtrs, gClassCount, sizeof(uintptr_t), GCUIntCmp);
 }
-static BOOL GCIsRegisteredClass(Class c) {
-    if (!gClasses || gClassCount == 0) return NO;
-    return bsearch(&c, gClasses, gClassCount, sizeof(Class), GCClassCmp) != NULL;
+static BOOL GCIsRegisteredClass(uintptr_t c) {
+    if (!gClassPtrs || gClassCount == 0) return NO;
+    return bsearch(&c, gClassPtrs, gClassCount, sizeof(uintptr_t), GCUIntCmp) != NULL;
 }
 
-// Is `o` really an Objective-C object? Read its isa via vm_read (safe), mask it,
+// Is `p` really an Objective-C object? Read its isa via vm_read (safe), mask it,
 // and confirm the candidate class is one the runtime actually registered.
-static BOOL GCIsObject(id o) {
-    if (!o || ((uintptr_t)o & 0x3)) return NO;          // null / misaligned
+// Works on a raw void* so ARC never sees an unverified object pointer.
+static BOOL GCIsObjectPtr(const void *p) {
+    uintptr_t pv = (uintptr_t)p;
+    if (pv < 0x1000 || (pv & 0x3)) return NO;            // null page / misaligned
     uintptr_t isa = 0;
-    if (!GCSafeRead((void *)o, &isa, sizeof(isa))) return NO;
-    Class c = (Class)(isa & ~(uintptr_t)0x3);            // no tagged ptrs on 32-bit
-    if ((uintptr_t)c < 0x1000) return NO;
+    if (!GCSafeRead(p, &isa, sizeof(isa))) return NO;
+    uintptr_t c = isa & ~(uintptr_t)0x3;                 // no tagged ptrs on 32-bit
+    if (c < 0x1000) return NO;
     return GCIsRegisteredClass(c);
 }
 
 // Safe printable description of ANYTHING: real objects -> -description; other
 // pointers -> first bytes as ascii+hex; unreadable -> just the pointer.
 static NSString *GCSafe(id o) {
-    if (!o) return @"(nil)";
-    if (GCIsObject(o)) {
+    const void *p = (__bridge const void *)o;
+    if (!p) return @"(nil)";
+    if (GCIsObjectPtr(p)) {
         @try { return [o description] ?: @"(nil-desc)"; }
         @catch (__unused id e) { return @"(desc-threw)"; }
     }
     unsigned char buf[40] = {0};
-    if (GCSafeRead((void *)o, buf, sizeof(buf) - 1)) {
+    if (GCSafeRead(p, buf, sizeof(buf) - 1)) {
         // ascii view (printable run)
         char ascii[41]; int n = 0;
         for (int i = 0; i < (int)sizeof(buf) - 1; i++) {
@@ -117,14 +124,14 @@ static NSString *GCSafe(id o) {
         }
         ascii[n] = 0;
         return [NSString stringWithFormat:@"<non-obj %p bytes='%s' %02x%02x%02x%02x%02x%02x%02x%02x>",
-                (void *)o, ascii, buf[0],buf[1],buf[2],buf[3],buf[4],buf[5],buf[6],buf[7]];
+                p, ascii, buf[0],buf[1],buf[2],buf[3],buf[4],buf[5],buf[6],buf[7]];
     }
-    return [NSString stringWithFormat:@"<unreadable %p>", (void *)o];
+    return [NSString stringWithFormat:@"<unreadable %p>", p];
 }
 
 // dictionaryRepresentation, but only if `o` is a verified object that responds.
 static NSString *GCDict(id o) {
-    if (!GCIsObject(o)) return @"(not-obj)";
+    if (!GCIsObjectPtr((__bridge const void *)o)) return @"(not-obj)";
     @try {
         if ([o respondsToSelector:@selector(dictionaryRepresentation)]) {
             id d = ((id(*)(id, SEL))objc_msgSend)(o, @selector(dictionaryRepresentation));
