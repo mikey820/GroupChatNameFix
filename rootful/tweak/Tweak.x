@@ -110,13 +110,69 @@ static void GCStampOutgoing(id msg, id chat, const char *where) {
     } @catch (__unused id e) {}
 }
 
+// Dump everything iOS 6 knows about this group room: the registry IMDChat's
+// full dictionary, and what the session maps the room <-> group id to.
+static void GCProbeGroup(id session, NSString *room, const char *where) {
+    @try {
+        // session: room -> group identifier (this is likely the wire identity)
+        if ([session respondsToSelector:@selector(groupChatIdentifierForChatRoom:)]) {
+            id gid = ((id(*)(id, SEL, id))objc_msgSend)(session, @selector(groupChatIdentifierForChatRoom:), room);
+            GCLOGB(@"PROBE[%s] groupChatIdentifierForChatRoom(%@) = %@", where, room, gid);
+        }
+        if ([session respondsToSelector:@selector(chatRoomForGroupChatIdentifier:)]) {
+            id r = ((id(*)(id, SEL, id))objc_msgSend)(session, @selector(chatRoomForGroupChatIdentifier:), room);
+            GCLOGB(@"PROBE[%s] chatRoomForGroupChatIdentifier(%@) = %@", where, room, r);
+        }
+        if ([session respondsToSelector:@selector(shouldImitateGroupChatUsingChatRooms)]) {
+            BOOL b = ((BOOL(*)(id, SEL))objc_msgSend)(session, @selector(shouldImitateGroupChatUsingChatRooms));
+            GCLOGB(@"PROBE[%s] shouldImitateGroupChatUsingChatRooms = %d", where, b);
+        }
+        // registry: full IMDChat dict for this room
+        Class reg = NSClassFromString(@"IMDChatRegistry");
+        id shared = nil;
+        if (reg && [reg respondsToSelector:@selector(sharedInstance)])
+            shared = ((id(*)(id, SEL))objc_msgSend)(reg, @selector(sharedInstance));
+        if (shared && [shared respondsToSelector:@selector(existingChatWithGUID:)]) {
+            for (NSString *g in @[ room,
+                                   [NSString stringWithFormat:@"iMessage;+;%@", room],
+                                   [NSString stringWithFormat:@"iMessage;-;%@", room] ]) {
+                id ch = ((id(*)(id, SEL, id))objc_msgSend)(shared, @selector(existingChatWithGUID:), g);
+                if (ch) {
+                    id d = [ch respondsToSelector:@selector(dictionaryRepresentation)]
+                        ? ((id(*)(id, SEL))objc_msgSend)(ch, @selector(dictionaryRepresentation)) : nil;
+                    GCLOGB(@"PROBE[%s] chatWithGUID(%@) = %@ :: dict=%@", where, g, ch, d);
+                    break;
+                }
+            }
+        }
+    } @catch (__unused id e) {}
+}
+
 // ===========================================================================
-// SEND hooks  (the fix)
+// SEND hooks  (the fix + deep probe)
 // ===========================================================================
 static void (*orig_sendMsg)(id, SEL, id, id, int);
 static void gc_sendMsg(id self, SEL _cmd, id msg, id chat, int style) {
+    NSString *room = GCRoomFromChatArg(chat);
+    if (room) GCProbeGroup(self, room, "send");
     GCStampOutgoing(msg, chat, "send");
     orig_sendMsg(self, _cmd, msg, chat, style);
+}
+
+// Deeper send: -sendMessage:toChatID:identifier:style:  (closer to the wire)
+static void (*orig_sendToChatID)(id, SEL, id, id, id, int);
+static void gc_sendToChatID(id self, SEL _cmd, id msg, id chatID, id identifier, int style) {
+    @try { GCLOGB(@"sendMessage:toChatID:%@ identifier:%@ style:%d msgRoom=%@",
+                  chatID, identifier, style, GCMsgRoom(msg)); }
+    @catch (__unused id e) {}
+    orig_sendToChatID(self, _cmd, msg, chatID, identifier, style);
+}
+
+// Routing dictionary builder — likely where wire group identity is assembled.
+static void (*orig_handleRouting)(id, SEL, id);
+static void gc_handleRouting(id self, SEL _cmd, id dict) {
+    @try { GCLOGB(@"_handleRoutingWithDictionary: %@", dict); } @catch (__unused id e) {}
+    orig_handleRouting(self, _cmd, dict);
 }
 
 static void (*orig_procSend)(id, SEL, id, id, int, id);
@@ -153,7 +209,7 @@ static BOOL GCHook1(NSString *cn, SEL sel, IMP repl, void *slot, const char *tag
 
 %ctor {
     @autoreleasepool {
-        GCLog(@"=== GroupChatNameFix 3.1.0-diag loaded in %@ ===",
+        GCLog(@"=== GroupChatNameFix 3.2.0-diag loaded in %@ ===",
               [[NSProcessInfo processInfo] processName]);
         NSString *S = @"IMDServiceSession";
         GCHook1(S, @selector(sendMessage:toChat:style:),
@@ -162,5 +218,9 @@ static BOOL GCHook1(NSString *cn, SEL sel, IMP repl, void *slot, const char *tag
                 (IMP)gc_procSend, &orig_procSend, "fix-procsend");
         GCHook1(S, @selector(didReceiveMessage:forChat:style:),
                 (IMP)gc_didRecv, &orig_didRecv, "diag-recv");
+        GCHook1(S, @selector(sendMessage:toChatID:identifier:style:),
+                (IMP)gc_sendToChatID, &orig_sendToChatID, "diag-sendChatID");
+        GCHook1(S, @selector(_handleRoutingWithDictionary:),
+                (IMP)gc_handleRouting, &orig_handleRouting, "diag-routing");
     }
 }
