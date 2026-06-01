@@ -159,6 +159,15 @@ static NSString *GCDict(const void *p) {
     return @"(no-dict)";
 }
 
+// Safe class name of a pointer (isa already verified by GCIsObjectPtr).
+static NSString *GCClass(const void *p) {
+    if (!GCIsObjectPtr(p)) return @"(not-obj)";
+    @try {
+        const char *n = class_getName(object_getClass((__bridge id)p));
+        return n ? [NSString stringWithUTF8String:n] : @"(no-name)";
+    } @catch (__unused id e) { return @"(cls-threw)"; }
+}
+
 // Probe a (verified) object for the identity getters that might carry a stable
 // group key. Each call is guarded by respondsToSelector: and the result is run
 // back through GCSafe (so a non-object/garbage return can't crash us either).
@@ -194,8 +203,8 @@ static NSString *GCProbe(const void *p) {
 static void (*orig_didRecv)(id, SEL, void *, void *, int);
 static void gc_didRecv(id self, SEL _cmd, void *msg, void *chat, int style) {
     @try {
-        GCLOGB(@"RECV style=%d\n    chat.probe=%@\n    chat.dict=%@\n    msg=%@",
-               style, GCProbe(chat), GCDict(chat), GCSafe(msg));
+        GCLOGB(@"RECV style=%d chat<%@>=%@\n    chat.probe=%@\n    msg.dict=%@\n    msg=%@",
+               style, GCClass(chat), GCSafe(chat), GCProbe(chat), GCDict(msg), GCSafe(msg));
     } @catch (__unused id e) {}
     orig_didRecv(self, _cmd, msg, chat, style);
 }
@@ -205,8 +214,8 @@ static void gc_didRecv(id self, SEL _cmd, void *msg, void *chat, int style) {
 static void (*orig_sendMsg)(id, SEL, void *, void *, int);
 static void gc_sendMsg(id self, SEL _cmd, void *msg, void *chat, int style) {
     @try {
-        GCLOGB(@"SEND style=%d\n    chat.probe=%@\n    chat.dict=%@",
-               style, GCProbe(chat), GCDict(chat));
+        GCLOGB(@"SEND style=%d chat<%@>=%@\n    chat.probe=%@\n    msg.dict=%@",
+               style, GCClass(chat), GCSafe(chat), GCProbe(chat), GCDict(msg));
     } @catch (__unused id e) {}
     orig_sendMsg(self, _cmd, msg, chat, style);
 }
@@ -243,7 +252,7 @@ static BOOL GCHook1(NSString *cn, SEL sel, IMP repl, void *slot, const char *tag
 %ctor {
     @autoreleasepool {
         GCBuildClassList();
-        GCLog(@"=== GroupChatNameFix 5.3.0-safehunt (recv+send chat probe) loaded in %@ (classes=%d) ===",
+        GCLog(@"=== GroupChatNameFix 5.3.1-safehunt (chat class+desc, msg.dict) loaded in %@ (classes=%d) ===",
               [[NSProcessInfo processInfo] processName], gClassCount);
         NSString *S = @"IMDServiceSession";
         GCHook1(S, @selector(didReceiveMessage:forChat:style:),
