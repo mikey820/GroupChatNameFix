@@ -233,6 +233,48 @@ static void GCProbeGroup(id session, NSString *room, const char *where) {
                     NSArray *trueRoster = gRoster[room];
                     GCLOGB(@"PROBE[%s] room=%@  chatParticipants=%@  TRUEroster=%@",
                            where, room, chatHandles, trueRoster);
+
+                    // ---- THE FIX: add any true-roster members missing from this chat ----
+                    NSMutableArray *missing = [NSMutableArray array];
+                    for (NSString *h in trueRoster)
+                        if (![chatHandles containsObject:h]) [missing addObject:h];
+                    if (missing.count) {
+                        unsigned before = (unsigned)[(NSArray *)parts count];
+                        BOOL added = NO;
+                        // Strategy 1: addParticipants: with handle strings
+                        if (!added && [ch respondsToSelector:@selector(addParticipants:)]) {
+                            @try {
+                                ((void(*)(id, SEL, id))objc_msgSend)(ch, @selector(addParticipants:), missing);
+                                added = YES;
+                            } @catch (__unused id e) {}
+                        }
+                        // Strategy 2: addParticipant: one at a time with strings
+                        if (!added && [ch respondsToSelector:@selector(addParticipant:)]) {
+                            @try {
+                                for (NSString *h in missing)
+                                    ((void(*)(id, SEL, id))objc_msgSend)(ch, @selector(addParticipant:), h);
+                                added = YES;
+                            } @catch (__unused id e) {}
+                        }
+                        id parts2 = [ch respondsToSelector:@selector(participants)]
+                            ? ((id(*)(id, SEL))objc_msgSend)(ch, @selector(participants)) : nil;
+                        unsigned after = [parts2 isKindOfClass:[NSArray class]] ? (unsigned)[parts2 count] : 0;
+                        GCLOGB(@"REPAIR[%s] room=%@ missing=%@ added=%d count %u->%u parts2=%@",
+                               where, room, missing, added, before, after, parts2);
+                        // If string-add didn't change the count, dump the handle class+init
+                        // so the next build can construct the right handle object.
+                        if (after <= before && [(NSArray *)parts count] > 0) {
+                            id h0 = [(NSArray *)parts objectAtIndex:0];
+                            Class hc = object_getClass(h0);
+                            NSMutableArray *inits = [NSMutableArray array];
+                            unsigned int n=0; Method *ms=class_copyMethodList(hc,&n);
+                            for (unsigned i=0;i<n;i++){ NSString *s=NSStringFromSelector(method_getName(ms[i]));
+                                if ([[s lowercaseString] rangeOfString:@"init"].location!=NSNotFound ||
+                                    [[s lowercaseString] rangeOfString:@"id"].location!=NSNotFound) [inits addObject:s]; }
+                            free(ms);
+                            GCLOGB(@"HANDLECLASS %@ methods=%@", NSStringFromClass(hc), inits);
+                        }
+                    }
                     break;
                 }
             }
@@ -305,7 +347,7 @@ static BOOL GCHook1(NSString *cn, SEL sel, IMP repl, void *slot, const char *tag
     @autoreleasepool {
         gDumpedClasses = [NSMutableSet set];
         GCRosterLoad();
-        GCLog(@"=== GroupChatNameFix 3.3.0-diag loaded in %@ (roster rooms=%u) ===",
+        GCLog(@"=== GroupChatNameFix 4.0.0 loaded in %@ (roster rooms=%u) ===",
               [[NSProcessInfo processInfo] processName], (unsigned)gRoster.count);
         NSString *S = @"IMDServiceSession";
         GCHook1(S, @selector(sendMessage:toChat:style:),
