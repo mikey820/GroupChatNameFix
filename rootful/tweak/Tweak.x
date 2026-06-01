@@ -2,55 +2,61 @@
 //
 // Problem
 // -------
-// On iOS 6, an iMessage group conversation is keyed by a group id (`gid`) that
-// the OS derives from the participant set. When someone on a newer iOS *names*
-// the group, iMessage migrates the conversation to a brand-new canonical `gid`
-// (with a group-version `gv`) and announces it. iOS 6 shows the new name (it
-// implements the group-name-update path) but keeps stamping its OLD,
-// participant-derived `gid` on everything it sends. Recipients, now keyed on
-// the new `gid`, therefore see every message from the iOS 6 device as a
-// separate, brand-new conversation.
+// A group iMessage that includes an iOS 6 device works fine until someone on a
+// newer iOS *renames* the group. After that, every message the iOS 6 device
+// sends shows up for everyone else as a brand-new conversation (the iOS 6
+// device itself still sees one continuous thread).
+//
+// Real mechanism (confirmed from the live IMDaemonCore runtime on iOS 6.1.4 —
+// see the v1 selector dump)
+// -------------------------------------------------------------------------
+// iOS 6 represents an iMessage group two ways inside imagent (IMDServiceSession):
+//
+//   * a "group chat identifier" derived from the participant set, and
+//   * a server "chat room" (roomName, e.g. "chatXXXXXXXXXXXXXXXX") used once
+//     the group is named.
+//
+// The two are linked by an in-memory table:
+//     -useChatRoom:forGroupChatIdentifier:      (establishes the mapping)
+//     -chatRoomForGroupChatIdentifier:          (group id  -> room)
+//     -groupChatIdentifierForChatRoom:          (room      -> group id)
+//
+// When the rename is received, -useChatRoom:forGroupChatIdentifier: records the
+// room. Incoming messages then arrive on the room (one thread, name adopted).
+// But when iOS 6 *sends*, imagent asks -chatRoomForGroupChatIdentifier: whether
+// there is a named room to route to. That mapping is volatile (lost across
+// imagent relaunches / reboots), so it returns nil, and the message goes out on
+// the bare participant group chat instead of the room. Recipients, keyed on the
+// room, treat it as a new conversation.
 //
 // Fix
 // ---
-// imagent builds the outgoing Madrid wire dictionary (keys gid, gv, p, t, x,
-// r, ...). We:
-//   1. LEARN: whenever a group message ARRIVES, remember the canonical
-//      (gid, gv) for that participant roster `p`.
-//   2. STAMP: whenever a group message is about to be SENT, if we have a
-//      learned canonical gid for that same roster and it differs from what the
-//      OS computed, rewrite gid (and gv) on the outgoing dictionary.
+//   1. LEARN  the group<->room mapping from -useChatRoom:forGroupChatIdentifier:
+//      and from any incoming/sent IMDChat that already carries a roomName, and
+//      PERSIST it to disk (this is what survives the imagent relaunch).
+//   2. RESTORE the mapping when imagent asks: if -chatRoomForGroupChatIdentifier:
+//      (or the reverse) returns nil, supply the persisted value.
+//   3. BACKSTOP: just before a send, if the target IMDChat has participants we
+//      know a room for but its own roomName is empty, stamp the room on with
+//      -setRoomName: so routing goes to the room.
 //
-// The rewrite only touches the on-the-wire dictionary, so iOS 6's own local
-// database / thread matching is left untouched (the conversation stays a
-// single local thread, exactly as it behaves today).
-//
-// NOTE ON METHOD NAMES
-// --------------------
-// The exact selectors that build the send dictionary / deliver incoming
-// messages could not be confirmed against this device offline (frameworks live
-// in the dyld shared cache; no strings/otool on device). So the hooks below
-// target a set of *candidate* classes/selectors, each guarded by
-// instancesRespondToSelector: and wrapped in @try/@catch — anything that does
-// not exist is simply skipped, so installation is always safe. On load the
-// tweak ALSO dumps the real, relevant selectors of the live IMDaemonCore
-// classes to the log, so the fix can be pinned to the exact methods in a
-// follow-up build if the candidates do not line up.
+// Everything is guarded and logged; if a precondition never triggers the log
+// says exactly what the live objects looked like so the next build can adjust.
 
 #import <Foundation/Foundation.h>
 #import <objc/message.h>
 #import <objc/runtime.h>
 
-// substrate.h is not bundled with theos; theos auto-links the substrate symbol
-// for tweaks, so we only need to declare the one function we call.
 extern void MSHookMessageEx(Class cls, SEL sel, IMP imp, IMP *result);
 
-static NSString *const kPrefPath = @"/var/mobile/Library/Preferences/com.mikey820.groupchatnamefix.plist";
-static NSString *const kLogPath  = @"/var/mobile/GroupChatNameFix.log";
+static NSString *const kByPartPath = @"/var/mobile/Library/Preferences/com.mikey820.groupchatnamefix.byparticipants.plist";
+static NSString *const kGrpRoomPath = @"/var/mobile/Library/Preferences/com.mikey820.groupchatnamefix.grouptoroom.plist";
+static NSString *const kLogPath     = @"/var/mobile/GroupChatNameFix.log";
 
-static NSMutableDictionary *gLearned;       // participantsKey -> @{ @"gid":..., @"gv":... }
-static dispatch_queue_t     gQueue;         // serialises gLearned + file IO
-static int                  gDumpBudget = 40; // cap verbose full-dict dumps
+static NSMutableDictionary *gByPart;     // participantsKey -> roomName (NSString)
+static NSMutableDictionary *gGrpToRoom;  // groupChatIdentifier -> roomName (NSString)
+static dispatch_queue_t     gQueue;      // serialises map access + file IO
+static int                  gLogBudget = 400;
 
 // ---------------------------------------------------------------------------
 // Logging
@@ -72,6 +78,24 @@ static void GCLog(NSString *fmt, ...) {
     } @catch (__unused id e) {}
     NSLog(@"[GroupChatNameFix] %@", msg);
 }
+#define GCLOGB(...) do { if (gLogBudget-- > 0) GCLog(__VA_ARGS__); } while (0)
+
+// ---------------------------------------------------------------------------
+// objc helpers (typed objc_msgSend wrappers, all selector-guarded by caller)
+// ---------------------------------------------------------------------------
+static id GCget(id obj, SEL sel) {
+    if (!obj || !sel || ![obj respondsToSelector:sel]) return nil;
+    return ((id(*)(id, SEL))objc_msgSend)(obj, sel);
+}
+static void GCset(id obj, SEL sel, id val) {
+    if (!obj || !sel || ![obj respondsToSelector:sel]) return;
+    ((void(*)(id, SEL, id))objc_msgSend)(obj, sel, val);
+}
+static NSString *GCstr(id v) {
+    if (!v) return nil;
+    if ([v isKindOfClass:[NSString class]]) return [(NSString *)v length] ? v : nil;
+    return nil;
+}
 
 // ---------------------------------------------------------------------------
 // Participant-roster -> stable key
@@ -90,215 +114,231 @@ static NSString *GCNormHandle(NSString *h) {
     return d;
 }
 
-static void GCCollectHandles(id obj, NSMutableSet *out) {
+static void GCCollectHandles(id obj, NSMutableSet *out, int depth) {
+    if (!obj || depth > 4) return;
     if ([obj isKindOfClass:[NSString class]]) {
         NSString *n = GCNormHandle(obj);
         if (n) [out addObject:n];
-    } else if ([obj isKindOfClass:[NSArray class]]) {
-        for (id e in (NSArray *)obj) GCCollectHandles(e, out);
+    } else if ([obj isKindOfClass:[NSArray class]] || [obj isKindOfClass:[NSSet class]]) {
+        for (id e in (id<NSFastEnumeration>)obj) GCCollectHandles(e, out, depth + 1);
     } else if ([obj isKindOfClass:[NSDictionary class]]) {
-        for (id v in [(NSDictionary *)obj allValues]) GCCollectHandles(v, out);
+        for (id v in [(NSDictionary *)obj allValues]) GCCollectHandles(v, out, depth + 1);
+    } else {
+        // IMHandle / IMDHandle-like objects: pull an identifier string.
+        for (NSString *selName in @[ @"ID", @"address", @"identifier", @"handle" ]) {
+            SEL s = NSSelectorFromString(selName);
+            if ([obj respondsToSelector:s]) {
+                id v = ((id(*)(id, SEL))objc_msgSend)(obj, s);
+                if ([v isKindOfClass:[NSString class]]) {
+                    NSString *n = GCNormHandle(v);
+                    if (n) { [out addObject:n]; return; }
+                }
+            }
+        }
     }
 }
 
-static NSString *GCParticipantsKey(id pValue) {
-    if (!pValue) return nil;
-    NSMutableSet *set = [NSMutableSet set];
-    GCCollectHandles(pValue, set);
-    if (set.count == 0) return nil;
-    NSArray *sorted = [[set allObjects] sortedArrayUsingSelector:@selector(compare:)];
-    return [sorted componentsJoinedByString:@","];
-}
-
-static BOOL GCIsGroup(NSDictionary *d) {
-    if (![d isKindOfClass:[NSDictionary class]]) return NO;
-    if (d[@"gid"]) return YES;
-    NSMutableSet *set = [NSMutableSet set];
-    GCCollectHandles(d[@"p"], set);
-    return set.count >= 3;
+static NSString *GCParticipantsKeyFromChat(id chat) {
+    @try {
+        id parts = GCget(chat, @selector(participants));
+        if (!parts) return nil;
+        NSMutableSet *set = [NSMutableSet set];
+        GCCollectHandles(parts, set, 0);
+        if (set.count < 2) return nil; // need a real multi-party roster
+        NSArray *sorted = [[set allObjects] sortedArrayUsingSelector:@selector(compare:)];
+        return [sorted componentsJoinedByString:@","];
+    } @catch (__unused id e) { return nil; }
 }
 
 // ---------------------------------------------------------------------------
 // Persistence
 // ---------------------------------------------------------------------------
 static void GCLoad(void) {
-    NSDictionary *d = [NSDictionary dictionaryWithContentsOfFile:kPrefPath];
-    gLearned = d ? [d mutableCopy] : [NSMutableDictionary dictionary];
+    NSDictionary *a = [NSDictionary dictionaryWithContentsOfFile:kByPartPath];
+    NSDictionary *b = [NSDictionary dictionaryWithContentsOfFile:kGrpRoomPath];
+    gByPart    = a ? [a mutableCopy] : [NSMutableDictionary dictionary];
+    gGrpToRoom = b ? [b mutableCopy] : [NSMutableDictionary dictionary];
 }
 static void GCSaveLocked(void) {
-    @try { [gLearned writeToFile:kPrefPath atomically:YES]; } @catch (__unused id e) {}
+    @try {
+        [gByPart    writeToFile:kByPartPath  atomically:YES];
+        [gGrpToRoom writeToFile:kGrpRoomPath atomically:YES];
+    } @catch (__unused id e) {}
 }
 
-// ---------------------------------------------------------------------------
-// Learn from an incoming dictionary
-// ---------------------------------------------------------------------------
-static void GCLearnFromDict(NSDictionary *d) {
-    if (![d isKindOfClass:[NSDictionary class]]) return;
-    if (!GCIsGroup(d)) return;
-    id gid = d[@"gid"];
-    id pv  = d[@"p"];
-    if (!gid || !pv) return;
-    NSString *key = GCParticipantsKey(pv);
-    if (key.length == 0) return;
-    id gv = d[@"gv"];
-
+// learn group-id -> room (plist-safe: both must be strings)
+static void GCLearnGroupRoom(NSString *groupId, NSString *room) {
+    groupId = GCstr(groupId); room = GCstr(room);
+    if (!groupId || !room) return;
     dispatch_async(gQueue, ^{
-        NSDictionary *prev = gLearned[key];
-        if (prev && [prev[@"gid"] isEqual:gid] &&
-            ((!gv && !prev[@"gv"]) || [prev[@"gv"] isEqual:gv])) {
-            return; // unchanged
-        }
-        NSMutableDictionary *entry = [NSMutableDictionary dictionary];
-        entry[@"gid"] = gid;
-        if (gv) entry[@"gv"] = gv;
-        gLearned[key] = entry;
+        if ([gGrpToRoom[groupId] isEqual:room]) return;
+        gGrpToRoom[groupId] = room;
         GCSaveLocked();
-        GCLog(@"LEARN gid=%@ gv=%@ key=%@", gid, gv, key);
+        GCLog(@"LEARN group->room  %@  =>  %@", groupId, room);
+    });
+}
+static void GCLearnPartRoom(NSString *partKey, NSString *room) {
+    partKey = GCstr(partKey); room = GCstr(room);
+    if (!partKey || !room) return;
+    dispatch_async(gQueue, ^{
+        if ([gByPart[partKey] isEqual:room]) return;
+        gByPart[partKey] = room;
+        GCSaveLocked();
+        GCLog(@"LEARN parts->room  %@  =>  %@", partKey, room);
     });
 }
 
-static void GCMaybeDumpIncoming(NSDictionary *d) {
-    if (!GCIsGroup(d)) return;
-    if (gDumpBudget-- > 0) GCLog(@"IN  dict=%@", d);
-}
-
-// ===========================================================================
-// OUTGOING hook  -dictionaryRepresentationForSending
-// ===========================================================================
-static NSDictionary *(*orig_dictForSending)(id, SEL);
-static NSDictionary *gc_dictForSending(id self, SEL _cmd) {
-    NSDictionary *d = orig_dictForSending(self, _cmd);
+// Learn whatever a live IMDChat can tell us (called on send & receive).
+static void GCLearnFromChat(id chat, const char *where) {
+    if (!chat) return;
     @try {
-        if ([d isKindOfClass:[NSDictionary class]] && GCIsGroup(d)) {
-            if (gDumpBudget-- > 0) GCLog(@"OUT dict(before)=%@", d);
-            NSString *key = GCParticipantsKey(d[@"p"]);
-            __block NSDictionary *learned = nil;
-            if (key.length) dispatch_sync(gQueue, ^{ learned = [gLearned[key] copy]; });
-            if (learned) {
-                id newGid = learned[@"gid"];
-                id curGid = d[@"gid"];
-                if (newGid && (!curGid || ![curGid isEqual:newGid])) {
-                    NSMutableDictionary *m = [d mutableCopy];
-                    m[@"gid"] = newGid;
-                    if (learned[@"gv"]) m[@"gv"] = learned[@"gv"];
-                    GCLog(@"OUT rewrite gid %@ -> %@ (gv=%@) key=%@",
-                          curGid, newGid, learned[@"gv"], key);
-                    return m;
-                }
-            }
+        NSString *room    = GCstr(GCget(chat, @selector(roomName)));
+        NSString *chatId  = GCstr(GCget(chat, @selector(chatIdentifier)));
+        NSString *guid    = GCstr(GCget(chat, @selector(guid)));
+        NSString *partKey = GCParticipantsKeyFromChat(chat);
+        GCLOGB(@"CHAT[%s] room=%@ chatId=%@ guid=%@ parts=%@",
+               where, room, chatId, guid, partKey);
+        if (room) {
+            if (partKey) GCLearnPartRoom(partKey, room);
+            if (chatId)  GCLearnGroupRoom(chatId, room);
         }
     } @catch (__unused id e) {}
-    return d;
+}
+
+static NSString *GCLookupRoomForChat(id chat) {
+    @try {
+        NSString *chatId  = GCstr(GCget(chat, @selector(chatIdentifier)));
+        NSString *partKey = GCParticipantsKeyFromChat(chat);
+        __block NSString *room = nil;
+        dispatch_sync(gQueue, ^{
+            if (chatId)  room = gGrpToRoom[chatId];
+            if (!room && partKey) room = gByPart[partKey];
+        });
+        return GCstr(room);
+    } @catch (__unused id e) { return nil; }
 }
 
 // ===========================================================================
-// INCOMING hooks (learn) - several candidates, all idempotent
+// LEARN the mapping directly  -useChatRoom:forGroupChatIdentifier:
 // ===========================================================================
-static NSDictionary *GCDictFromArg(id arg) {
-    if ([arg isKindOfClass:[NSDictionary class]]) return arg;
-    if ([arg respondsToSelector:@selector(dictionaryRepresentation)])
-        return ((id(*)(id, SEL))objc_msgSend)(arg, @selector(dictionaryRepresentation));
-    if ([arg respondsToSelector:@selector(dictionaryRepresentationForSending)])
-        return ((id(*)(id, SEL))objc_msgSend)(arg, @selector(dictionaryRepresentationForSending));
-    return nil;
+static void (*orig_useRoom)(id, SEL, id, id);
+static void gc_useRoom(id self, SEL _cmd, id room, id groupId) {
+    @try {
+        GCLog(@"useChatRoom: %@ (%@)  forGroupChatIdentifier: %@ (%@)",
+              room, [room class], groupId, [groupId class]);
+        GCLearnGroupRoom(GCstr(groupId), GCstr(room));
+    } @catch (__unused id e) {}
+    orig_useRoom(self, _cmd, room, groupId);
 }
 
-static void (*orig_procRecv)(id, SEL, id, id);            // processReceivedMessage:forAccount:
-static void gc_procRecv(id self, SEL _cmd, id msg, id account) {
-    @try { NSDictionary *d = GCDictFromArg(msg); GCMaybeDumpIncoming(d); GCLearnFromDict(d); }
-    @catch (__unused id e) {}
-    orig_procRecv(self, _cmd, msg, account);
-}
-
-static void (*orig_procIn)(id, SEL, id);                  // _processIncomingMessage:
-static void gc_procIn(id self, SEL _cmd, id msg) {
-    @try { NSDictionary *d = GCDictFromArg(msg); GCMaybeDumpIncoming(d); GCLearnFromDict(d); }
-    @catch (__unused id e) {}
-    orig_procIn(self, _cmd, msg);
-}
-
-// service:account:incomingMessage:fromIDQueryController:  (IDS delivery)
-static void (*orig_idsIncoming)(id, SEL, id, id, id, id);
-static void gc_idsIncoming(id self, SEL _cmd, id service, id account, id msg, id qc) {
-    @try { NSDictionary *d = GCDictFromArg(msg); GCMaybeDumpIncoming(d); GCLearnFromDict(d); }
-    @catch (__unused id e) {}
-    orig_idsIncoming(self, _cmd, service, account, msg, qc);
-}
-
-// ---------------------------------------------------------------------------
-// Hook installation + runtime selector discovery
-// ---------------------------------------------------------------------------
-static BOOL GCHook(NSArray *classNames, SEL sel, IMP repl, void *origSlot, const char *label) {
-    for (NSString *cn in classNames) {
-        Class c = NSClassFromString(cn);
-        if (c && [c instancesRespondToSelector:sel]) {
-            MSHookMessageEx(c, sel, repl, (IMP *)origSlot);
-            GCLog(@"HOOKED %@ on %@ [%s]", NSStringFromSelector(sel), cn, label);
-            return YES;
+// ===========================================================================
+// RESTORE  -chatRoomForGroupChatIdentifier:   (group id -> room)
+// ===========================================================================
+static id (*orig_roomForGroup)(id, SEL, id);
+static id gc_roomForGroup(id self, SEL _cmd, id groupId) {
+    id room = orig_roomForGroup(self, _cmd, groupId);
+    @try {
+        if (!GCstr(room)) {
+            __block NSString *learned = nil;
+            NSString *gid = GCstr(groupId);
+            if (gid) dispatch_sync(gQueue, ^{ learned = gGrpToRoom[gid]; });
+            if (learned) {
+                GCLog(@"RESTORE room for group %@ -> %@ (orig nil)", gid, learned);
+                return learned;
+            }
+        } else {
+            // opportunistically learn the live mapping too
+            GCLearnGroupRoom(GCstr(groupId), GCstr(room));
         }
+    } @catch (__unused id e) {}
+    return room;
+}
+
+// ===========================================================================
+// RESTORE  -groupChatIdentifierForChatRoom:   (room -> group id)  [symmetry]
+// ===========================================================================
+static id (*orig_groupForRoom)(id, SEL, id);
+static id gc_groupForRoom(id self, SEL _cmd, id room) {
+    id gid = orig_groupForRoom(self, _cmd, room);
+    @try {
+        if (GCstr(gid) && GCstr(room)) GCLearnGroupRoom(GCstr(gid), GCstr(room));
+    } @catch (__unused id e) {}
+    return gid;
+}
+
+// ===========================================================================
+// LEARN on receive  -didReceiveMessage:forChat:style:
+// ===========================================================================
+static void (*orig_didRecv)(id, SEL, id, id, int);
+static void gc_didRecv(id self, SEL _cmd, id msg, id chat, int style) {
+    @try { GCLearnFromChat(chat, "recv"); } @catch (__unused id e) {}
+    orig_didRecv(self, _cmd, msg, chat, style);
+}
+
+// ===========================================================================
+// BACKSTOP on send  -sendMessage:toChat:style:
+//                   -processMessageForSending:toChat:style:completionBlock:
+// ===========================================================================
+static void GCFixOutgoingChat(id chat, const char *where) {
+    @try {
+        GCLearnFromChat(chat, where);
+        NSString *room = GCstr(GCget(chat, @selector(roomName)));
+        if (room) return;                       // already a proper room chat
+        NSString *learned = GCLookupRoomForChat(chat);
+        if (learned && [chat respondsToSelector:@selector(setRoomName:)]) {
+            GCset(chat, @selector(setRoomName:), learned);
+            GCLog(@"FIX[%s] stamped roomName=%@ on outgoing chat (chatId=%@)",
+                  where, learned, GCstr(GCget(chat, @selector(chatIdentifier))));
+        }
+    } @catch (__unused id e) {}
+}
+
+static void (*orig_sendMsg)(id, SEL, id, id, int);
+static void gc_sendMsg(id self, SEL _cmd, id msg, id chat, int style) {
+    GCFixOutgoingChat(chat, "send");
+    orig_sendMsg(self, _cmd, msg, chat, style);
+}
+
+static void (*orig_procSend)(id, SEL, id, id, int, id);
+static void gc_procSend(id self, SEL _cmd, id msg, id chat, int style, id block) {
+    GCFixOutgoingChat(chat, "procSend");
+    orig_procSend(self, _cmd, msg, chat, style, block);
+}
+
+// ---------------------------------------------------------------------------
+// Hook helper
+// ---------------------------------------------------------------------------
+static BOOL GCHook1(NSString *cn, SEL sel, IMP repl, void *slot, const char *tag) {
+    Class c = NSClassFromString(cn);
+    if (c && [c instancesRespondToSelector:sel]) {
+        MSHookMessageEx(c, sel, repl, (IMP *)slot);
+        GCLog(@"HOOKED -[%@ %@]  [%s]", cn, NSStringFromSelector(sel), tag);
+        return YES;
     }
-    GCLog(@"MISS  no class implements %@ [%s] (tried: %@)",
-          NSStringFromSelector(sel), label, [classNames componentsJoinedByString:@", "]);
+    GCLog(@"MISS  -[%@ %@]  [%s]", cn, NSStringFromSelector(sel), tag);
     return NO;
-}
-
-// Dump the selectors of a live class that look relevant, so we can pin the
-// exact method names from the device's own runtime.
-static void GCDumpClass(NSString *name) {
-    Class c = NSClassFromString(name);
-    if (!c) { GCLog(@"DUMP %@ : ABSENT", name); return; }
-    NSArray *needles = @[ @"group", @"gid", @"guid", @"send", @"receiv",
-                          @"incoming", @"dictionary", @"process", @"madrid", @"name" ];
-    unsigned int n = 0;
-    Method *ms = class_copyMethodList(c, &n);
-    NSMutableArray *hits = [NSMutableArray array];
-    for (unsigned i = 0; i < n; i++) {
-        NSString *s = NSStringFromSelector(method_getName(ms[i]));
-        NSString *l = [s lowercaseString];
-        for (NSString *nd in needles) {
-            if ([l rangeOfString:nd].location != NSNotFound) { [hits addObject:s]; break; }
-        }
-    }
-    free(ms);
-    GCLog(@"DUMP %@ (%u methods) relevant: %@", name, n,
-          hits.count ? [hits componentsJoinedByString:@", "] : @"(none)");
 }
 
 %ctor {
     @autoreleasepool {
         gQueue = dispatch_queue_create("com.mikey820.groupchatnamefix.q", DISPATCH_QUEUE_SERIAL);
         GCLoad();
-        GCLog(@"=== GroupChatNameFix 1.0.0 loaded in %@ (%lu learned) ===",
-              [[NSProcessInfo processInfo] processName], (unsigned long)gLearned.count);
+        GCLog(@"=== GroupChatNameFix 2.0.0 loaded in %@ (byPart=%lu grpRoom=%lu) ===",
+              [[NSProcessInfo processInfo] processName],
+              (unsigned long)gByPart.count, (unsigned long)gGrpToRoom.count);
 
-        // Discover the real selectors from the live runtime (for refinement).
-        for (NSString *cn in @[ @"IMDMessage", @"IMDChat", @"IMDChatRegistry",
-                                @"IMDMessageStore", @"IMDServiceSession",
-                                @"IMDAccount", @"IMDAccountController",
-                                @"IMDMessageProcessingController",
-                                @"IMMessage", @"IMChat" ]) {
-            GCDumpClass(cn);
-        }
-
-        // OUTGOING: stamp the canonical gid onto the wire dictionary.
-        GCHook(@[ @"IMDMessage", @"IMDChat", @"IMDMessageStore",
-                  @"IMDPersistentMessage", @"IMMessage", @"IMMessageItem" ],
-               @selector(dictionaryRepresentationForSending),
-               (IMP)gc_dictForSending, &orig_dictForSending, "send");
-
-        // INCOMING: learn canonical gid per participant roster.
-        GCHook(@[ @"IMDMessageProcessingController", @"IMDServiceSession",
-                  @"IMDAccountController" ],
-               @selector(processReceivedMessage:forAccount:),
-               (IMP)gc_procRecv, &orig_procRecv, "recv");
-
-        GCHook(@[ @"IMDMessageProcessingController", @"IMDServiceSession" ],
-               @selector(_processIncomingMessage:),
-               (IMP)gc_procIn, &orig_procIn, "procIn");
-
-        GCHook(@[ @"IMDServiceSession", @"IMDAccountController",
-                  @"IMDMessageProcessingController" ],
-               @selector(service:account:incomingMessage:fromIDQueryController:),
-               (IMP)gc_idsIncoming, &orig_idsIncoming, "ids");
+        NSString *S = @"IMDServiceSession";
+        GCHook1(S, @selector(useChatRoom:forGroupChatIdentifier:),
+                (IMP)gc_useRoom, &orig_useRoom, "learn-map");
+        GCHook1(S, @selector(chatRoomForGroupChatIdentifier:),
+                (IMP)gc_roomForGroup, &orig_roomForGroup, "restore-room");
+        GCHook1(S, @selector(groupChatIdentifierForChatRoom:),
+                (IMP)gc_groupForRoom, &orig_groupForRoom, "restore-group");
+        GCHook1(S, @selector(didReceiveMessage:forChat:style:),
+                (IMP)gc_didRecv, &orig_didRecv, "learn-recv");
+        GCHook1(S, @selector(sendMessage:toChat:style:),
+                (IMP)gc_sendMsg, &orig_sendMsg, "fix-send");
+        GCHook1(S, @selector(processMessageForSending:toChat:style:completionBlock:),
+                (IMP)gc_procSend, &orig_procSend, "fix-procsend");
     }
 }
