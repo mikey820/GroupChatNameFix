@@ -273,54 +273,71 @@ static void gc_useRoom(id self, SEL _cmd, void *room, void *groupId) {
     orig_useRoom(self, _cmd, room, groupId);
 }
 
+// --- chat-lifecycle hooks: where iOS6 would LEARN a renamed group's new room ---
+static void (*orig_didInvite)(id, SEL, void *, void *, int);
+static void gc_didInvite(id self, SEL _cmd, void *inv, void *chat, int style) {
+    @try { GCLOGB(@"*** INVITE chat<%@>=%@ style=%d inv=%@", GCClass(chat), GCSafe(chat), style, GCSafe(inv)); }
+    @catch (__unused id e) {}
+    orig_didInvite(self, _cmd, inv, chat, style);
+}
+
+static void (*orig_didJoin)(id, SEL, void *, int);
+static void gc_didJoin(id self, SEL _cmd, void *chat, int style) {
+    @try { GCLOGB(@"*** JOIN chat<%@>=%@ style=%d", GCClass(chat), GCSafe(chat), style); }
+    @catch (__unused id e) {}
+    orig_didJoin(self, _cmd, chat, style);
+}
+
+static void (*orig_didJoinHI)(id, SEL, void *, int, void *);
+static void gc_didJoinHI(id self, SEL _cmd, void *chat, int style, void *hi) {
+    @try { GCLOGB(@"*** JOIN-HI chat<%@>=%@ style=%d hi=%@", GCClass(chat), GCSafe(chat), style, GCSafe(hi)); }
+    @catch (__unused id e) {}
+    orig_didJoinHI(self, _cmd, chat, style, hi);
+}
+
+static void (*orig_chatStatus)(id, SEL, void *, void *, int);
+static void gc_chatStatus(id self, SEL _cmd, void *status, void *chat, int style) {
+    @try { GCLOGB(@"*** CHATSTATUS chat<%@>=%@ status=%p style=%d", GCClass(chat), GCSafe(chat), status, style); }
+    @catch (__unused id e) {}
+    orig_chatStatus(self, _cmd, status, chat, style);
+}
+
+static void (*orig_chatStatusHI)(id, SEL, void *, void *, int, void *);
+static void gc_chatStatusHI(id self, SEL _cmd, void *status, void *chat, int style, void *hi) {
+    @try { GCLOGB(@"*** CHATSTATUS-HI chat<%@>=%@ status=%p style=%d hi=%@", GCClass(chat), GCSafe(chat), status, style, GCSafe(hi)); }
+    @catch (__unused id e) {}
+    orig_chatStatusHI(self, _cmd, status, chat, style, hi);
+}
+
+static void (*orig_regChat)(id, SEL, void *, int);
+static void gc_regChat(id self, SEL _cmd, void *chat, int style) {
+    @try { GCLOGB(@"*** REGCHAT chat<%@>=%@ style=%d", GCClass(chat), GCSafe(chat), style); }
+    @catch (__unused id e) {}
+    orig_regChat(self, _cmd, chat, style);
+}
+
+static void (*orig_regChatHI)(id, SEL, void *, int, void *);
+static void gc_regChatHI(id self, SEL _cmd, void *chat, int style, void *hi) {
+    @try { GCLOGB(@"*** REGCHAT-HI chat<%@>=%@ style=%d hi=%@", GCClass(chat), GCSafe(chat), style, GCSafe(hi)); }
+    @catch (__unused id e) {}
+    orig_regChatHI(self, _cmd, chat, style, hi);
+}
+
+static void (*orig_member)(id, SEL, void *, void *, void *, int);
+static void gc_member(id self, SEL _cmd, void *status, void *handle, void *chat, int style) {
+    @try { GCLOGB(@"*** MEMBER chat<%@>=%@ handle=%@ status=%p style=%d", GCClass(chat), GCSafe(chat), GCSafe(handle), status, style); }
+    @catch (__unused id e) {}
+    orig_member(self, _cmd, status, handle, chat, style);
+}
+
+static void (*orig_routing)(id, SEL, void *, void *, void *);
+static void gc_routing(id self, SEL _cmd, void *msgGUID, void *chatGUID, void *err) {
+    @try { GCLOGB(@"*** ROUTING msgGUID=%@ chatGUID=%@", GCSafe(msgGUID), GCSafe(chatGUID)); }
+    @catch (__unused id e) {}
+    orig_routing(self, _cmd, msgGUID, chatGUID, err);
+}
+
 // ---------------------------------------------------------------------------
-// Enumerate the WHOLE runtime for methods that look like a raw incoming-message
-// handler (the upstream point that still holds the wire dictionary, where a
-// renamed group's new room id would live if it reaches iOS 6 at all).
-// Dump EVERY instance method of a class (and its superclasses up to NSObject).
-static void GCDumpAll(NSString *clsName) {
-    Class c = NSClassFromString(clsName);
-    if (!c) { GCLog(@"DUMPALL no class %@", clsName); return; }
-    for (Class cur = c; cur && cur != [NSObject class]; cur = class_getSuperclass(cur)) {
-        unsigned int mc = 0;
-        Method *ms = class_copyMethodList(cur, &mc);
-        for (unsigned int j = 0; j < mc; j++)
-            GCLOGB(@"  M %s :: %s", class_getName(cur), sel_getName(method_getName(ms[j])));
-        if (ms) free(ms);
-    }
-    GCLog(@"DUMPALL %@ done", clsName);
-}
-
-// Hunt the whole runtime for message<->dictionary parsers (where a raw wire dict
-// with the renamed group's new room id would be handled, if it reaches iOS 6).
-static void GCHuntIncoming(void) {
-    int n = objc_getClassList(NULL, 0);
-    if (n <= 0) return;
-    Class *cls = (Class *)malloc(sizeof(Class) * n);
-    if (!cls) return;
-    n = objc_getClassList(cls, n);
-    int hits = 0;
-    for (int i = 0; i < n; i++) {
-        unsigned int mc = 0;
-        Method *ms = class_copyMethodList(cls[i], &mc);
-        for (unsigned int j = 0; j < mc; j++) {
-            const char *nm = sel_getName(method_getName(ms[j]));
-            if (strstr(nm, "essageWithDictionary") || strstr(nm, "essageForDictionary") ||
-                strstr(nm, "romDictionary")        || strstr(nm, "FromDictionary")      ||
-                strstr(nm, "arseMessage")          || strstr(nm, "ecodeMessage")        ||
-                strstr(nm, "ncomingMessage")       || strstr(nm, "essageReceived")       ||
-                strstr(nm, "eceivedMessage")       || strstr(nm, "rocessMessage")        ||
-                strstr(nm, "andleMessage")         || strstr(nm, "essage:fromID")) {
-                GCLOGB(@"  INMETH %s :: %s", class_getName(cls[i]), nm);
-                hits++;
-            }
-        }
-        if (ms) free(ms);
-    }
-    free(cls);
-    GCLog(@"INMETH hunt done (%d hits)", hits);
-}
-
 static BOOL GCHook1(NSString *cn, SEL sel, IMP repl, void *slot, const char *tag) {
     Class c = NSClassFromString(cn);
     if (c && [c instancesRespondToSelector:sel]) {
@@ -335,15 +352,31 @@ static BOOL GCHook1(NSString *cn, SEL sel, IMP repl, void *slot, const char *tag
 %ctor {
     @autoreleasepool {
         GCBuildClassList();
-        GCLog(@"=== GroupChatNameFix 5.6.0-hunt (full IMDServiceSession dump + msg probe) loaded in %@ (classes=%d) ===",
+        GCLog(@"=== GroupChatNameFix 5.7.0-hunt (chat-lifecycle: invite/join/status/register/route) loaded in %@ (classes=%d) ===",
               [[NSProcessInfo processInfo] processName], gClassCount);
-        GCHuntIncoming();
-        GCDumpAll(@"IMDServiceSession");
         NSString *S = @"IMDServiceSession";
         GCHook1(S, @selector(didReceiveMessage:forChat:style:),
                 (IMP)gc_didRecv, &orig_didRecv, "recv");
         GCHook1(S, @selector(sendMessage:toChat:style:),
                 (IMP)gc_sendMsg, &orig_sendMsg, "send");
+        GCHook1(S, @selector(didReceiveInvitation:forChat:style:),
+                (IMP)gc_didInvite, &orig_didInvite, "invite");
+        GCHook1(S, @selector(didJoinChat:style:),
+                (IMP)gc_didJoin, &orig_didJoin, "join");
+        GCHook1(S, @selector(didJoinChat:style:handleInfo:),
+                (IMP)gc_didJoinHI, &orig_didJoinHI, "join-hi");
+        GCHook1(S, @selector(didUpdateChatStatus:chat:style:),
+                (IMP)gc_chatStatus, &orig_chatStatus, "status");
+        GCHook1(S, @selector(didUpdateChatStatus:chat:style:handleInfo:),
+                (IMP)gc_chatStatusHI, &orig_chatStatusHI, "status-hi");
+        GCHook1(S, @selector(registerChat:style:),
+                (IMP)gc_regChat, &orig_regChat, "regchat");
+        GCHook1(S, @selector(registerChat:style:handleInfo:),
+                (IMP)gc_regChatHI, &orig_regChatHI, "regchat-hi");
+        GCHook1(S, @selector(didChangeMemberStatus:forHandle:forChat:style:),
+                (IMP)gc_member, &orig_member, "member");
+        GCHook1(S, @selector(_updateRoutingForMessageGUID:chatGUID:error:),
+                (IMP)gc_routing, &orig_routing, "routing");
         GCHook1(S, @selector(renameGroup:to:),
                 (IMP)gc_renameGroup, &orig_renameGroup, "rename");
         GCHook1(S, @selector(useChatRoom:forGroupChatIdentifier:),
