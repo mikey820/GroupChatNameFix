@@ -98,6 +98,57 @@ static NSString *GCstr(id v) {
 }
 
 // ---------------------------------------------------------------------------
+// Diagnostics: describe an arbitrary argument + dump a class's methods once
+// ---------------------------------------------------------------------------
+static NSMutableSet *gDumpedClasses;
+
+static void GCDumpClassMethods(id obj, const char *tag) {
+    if (!obj) return;
+    Class c = object_getClass(obj);
+    NSString *cn = NSStringFromClass(c);
+    @synchronized (gDumpedClasses) {
+        if ([gDumpedClasses containsObject:cn]) return;
+        [gDumpedClasses addObject:cn];
+    }
+    NSMutableArray *all = [NSMutableArray array];
+    Class cur = c;
+    int depth = 0;
+    while (cur && depth < 4) {              // walk a few superclasses
+        unsigned int n = 0;
+        Method *ms = class_copyMethodList(cur, &n);
+        for (unsigned i = 0; i < n; i++) {
+            NSString *s = NSStringFromSelector(method_getName(ms[i]));
+            NSString *l = [s lowercaseString];
+            if ([l rangeOfString:@"room"].location != NSNotFound ||
+                [l rangeOfString:@"guid"].location != NSNotFound ||
+                [l rangeOfString:@"chat"].location != NSNotFound ||
+                [l rangeOfString:@"ident"].location != NSNotFound ||
+                [l rangeOfString:@"particip"].location != NSNotFound ||
+                [l rangeOfString:@"group"].location != NSNotFound ||
+                [l rangeOfString:@"handle"].location != NSNotFound ||
+                [l rangeOfString:@"recipient"].location != NSNotFound ||
+                [l rangeOfString:@"dictionary"].location != NSNotFound) {
+                [all addObject:s];
+            }
+        }
+        free(ms);
+        cur = class_getSuperclass(cur);
+        depth++;
+    }
+    GCLog(@"CLASSDUMP[%s] %@ relevant: %@", tag, cn,
+          all.count ? [all componentsJoinedByString:@", "] : @"(none)");
+}
+
+static void GCDescribeArg(id arg, const char *label) {
+    if (!arg) { GCLOGB(@"  arg %s = nil", label); return; }
+    NSString *desc = nil;
+    @try { desc = [arg description]; } @catch (__unused id e) {}
+    if (desc.length > 300) desc = [desc substringToIndex:300];
+    GCLOGB(@"  arg %s : %@ = %@", label, NSStringFromClass(object_getClass(arg)), desc);
+    GCDumpClassMethods(arg, label);
+}
+
+// ---------------------------------------------------------------------------
 // Participant-roster -> stable key
 // ---------------------------------------------------------------------------
 static NSString *GCNormHandle(NSString *h) {
@@ -271,7 +322,12 @@ static id gc_groupForRoom(id self, SEL _cmd, id room) {
 // ===========================================================================
 static void (*orig_didRecv)(id, SEL, id, id, int);
 static void gc_didRecv(id self, SEL _cmd, id msg, id chat, int style) {
-    @try { GCLearnFromChat(chat, "recv"); } @catch (__unused id e) {}
+    @try {
+        GCLOGB(@"didReceiveMessage:forChat:style:%d", style);
+        GCDescribeArg(msg,  "recv.msg");
+        GCDescribeArg(chat, "recv.chat");
+        GCLearnFromChat(chat, "recv");
+    } @catch (__unused id e) {}
     orig_didRecv(self, _cmd, msg, chat, style);
 }
 
@@ -281,6 +337,7 @@ static void gc_didRecv(id self, SEL _cmd, id msg, id chat, int style) {
 // ===========================================================================
 static void GCFixOutgoingChat(id chat, const char *where) {
     @try {
+        GCDescribeArg(chat, where);
         GCLearnFromChat(chat, where);
         NSString *room = GCstr(GCget(chat, @selector(roomName)));
         if (room) return;                       // already a proper room chat
@@ -295,12 +352,14 @@ static void GCFixOutgoingChat(id chat, const char *where) {
 
 static void (*orig_sendMsg)(id, SEL, id, id, int);
 static void gc_sendMsg(id self, SEL _cmd, id msg, id chat, int style) {
+    @try { GCDescribeArg(msg, "send.msg"); } @catch (__unused id e) {}
     GCFixOutgoingChat(chat, "send");
     orig_sendMsg(self, _cmd, msg, chat, style);
 }
 
 static void (*orig_procSend)(id, SEL, id, id, int, id);
 static void gc_procSend(id self, SEL _cmd, id msg, id chat, int style, id block) {
+    @try { GCDescribeArg(msg, "procSend.msg"); } @catch (__unused id e) {}
     GCFixOutgoingChat(chat, "procSend");
     orig_procSend(self, _cmd, msg, chat, style, block);
 }
@@ -322,8 +381,9 @@ static BOOL GCHook1(NSString *cn, SEL sel, IMP repl, void *slot, const char *tag
 %ctor {
     @autoreleasepool {
         gQueue = dispatch_queue_create("com.mikey820.groupchatnamefix.q", DISPATCH_QUEUE_SERIAL);
+        gDumpedClasses = [NSMutableSet set];
         GCLoad();
-        GCLog(@"=== GroupChatNameFix 2.0.0 loaded in %@ (byPart=%lu grpRoom=%lu) ===",
+        GCLog(@"=== GroupChatNameFix 2.1.0-diag loaded in %@ (byPart=%lu grpRoom=%lu) ===",
               [[NSProcessInfo processInfo] processName],
               (unsigned long)gByPart.count, (unsigned long)gGrpToRoom.count);
 
