@@ -222,29 +222,45 @@ static void gc_didRecv(id self, SEL _cmd, void *msg, void *chat, int style) {
     orig_didRecv(self, _cmd, msg, chat, style);
 }
 
-// SEND — POC FIX. On a group send (style 43) the outgoing FZMessage carries the
-// STALE pre-rename room. Stripping it (v5.4.0) still forked. This build REMAPS
-// the stale room to the renamed group's CURRENT room (read off the modern device
-// dev35's sms.db). If modern now threads iOS6's messages into the renamed group,
-// the approach works and a live companion-relay version is justified. Targeted
-// by exact stale-room match so OTHER groups are untouched. msg.roomName drives
-// the wire (proven in v5.4.0); local `chat` arg left intact so iOS6's view holds.
-static NSString *const kStaleRoom = @"chat946155922201036467";  // iOS6's pinned old room
-static NSString *const kNewRoom   = @"chat805521337945948089";  // current renamed-group room (dev35)
-static BOOL gRemapEnabled = YES;
+// SEND — controllable A/B remap. The config file holds "staleRoom=newRoom" lines
+// (read fresh on every group send, so it can be re-pointed over SSH after a rename
+// with NO rebuild). If the outgoing FZMessage's roomName matches a stale entry, we
+// rewrite it to the mapped current room. Empty/absent file = stock (no remap), for
+// a clean A/B. Targeted by exact match so other groups are untouched. msg.roomName
+// drives the wire (proven v5.4.0); local `chat` arg untouched so iOS6's view holds.
+static NSString *const kRemapPath = @"/var/mobile/gcnf_remap.txt";
+static NSString *GCRemapTarget(NSString *cur) {
+    if (!cur) return nil;
+    NSError *e = nil;
+    NSString *cfg = [NSString stringWithContentsOfFile:kRemapPath encoding:NSUTF8StringEncoding error:&e];
+    if (!cfg) return nil;
+    NSCharacterSet *ws = [NSCharacterSet whitespaceCharacterSet];
+    for (NSString *line in [cfg componentsSeparatedByString:@"\n"]) {
+        NSRange eq = [line rangeOfString:@"="];
+        if (eq.location == NSNotFound) continue;
+        NSString *stale = [[line substringToIndex:eq.location] stringByTrimmingCharactersInSet:ws];
+        NSString *neu   = [[line substringFromIndex:eq.location + 1] stringByTrimmingCharactersInSet:ws];
+        if (neu.length && [stale isEqualToString:cur]) return neu;
+    }
+    return nil;
+}
 static void (*orig_sendMsg)(id, SEL, void *, void *, int);
 static void gc_sendMsg(id self, SEL _cmd, void *msg, void *chat, int style) {
     @try {
         BOOL remapped = NO;
-        if (gRemapEnabled && style == 43 && GCIsObjectPtr(msg)) {
+        if (style == 43 && GCIsObjectPtr(msg)) {
             id m = (__bridge id)msg;
             if ([m respondsToSelector:@selector(roomName)] &&
                 [m respondsToSelector:@selector(setRoomName:)]) {
                 void *rnp = ((void *(*)(id, SEL))objc_msgSend)(m, @selector(roomName));
-                if (GCIsObjectPtr(rnp) && [kStaleRoom isEqual:(__bridge id)rnp]) {
-                    ((void(*)(id, SEL, id))objc_msgSend)(m, @selector(setRoomName:), kNewRoom);
-                    GCLOGB(@"SEND-REMAP style=%d %@ -> %@", style, kStaleRoom, kNewRoom);
-                    remapped = YES;
+                if (GCIsObjectPtr(rnp)) {
+                    NSString *cur = (__bridge NSString *)rnp;
+                    NSString *neu = GCRemapTarget(cur);
+                    if (neu) {
+                        ((void(*)(id, SEL, id))objc_msgSend)(m, @selector(setRoomName:), neu);
+                        GCLOGB(@"SEND-REMAP style=%d %@ -> %@", style, cur, neu);
+                        remapped = YES;
+                    }
                 }
             }
         }
@@ -352,7 +368,7 @@ static BOOL GCHook1(NSString *cn, SEL sel, IMP repl, void *slot, const char *tag
 %ctor {
     @autoreleasepool {
         GCBuildClassList();
-        GCLog(@"=== GroupChatNameFix 5.8.0-POC (remap stale room -> current renamed room) loaded in %@ (classes=%d) ===",
+        GCLog(@"=== GroupChatNameFix 5.9.0-AB (file-configurable room remap) loaded in %@ (classes=%d) ===",
               [[NSProcessInfo processInfo] processName], gClassCount);
         NSString *S = @"IMDServiceSession";
         GCHook1(S, @selector(didReceiveMessage:forChat:style:),
