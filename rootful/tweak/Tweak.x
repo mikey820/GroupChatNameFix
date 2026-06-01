@@ -1,6 +1,14 @@
 // GroupChatNameFix - iOS 6 (armv7) tweak for /usr/libexec/imagent
 //
-// v5.2.1-safehunt : CRASH-PROOF introspection of the rename/room control plane.
+// v5.3.0-safehunt : probe the incoming-message IMDChat + outgoing send identity.
+// -----------------------------------------------------------------------------
+// Finding from v5.2.1: when a modern device renames the group, iOS 6 fires NONE
+// of renameGroup/changeGroup/changeGroups/useChatRoom. Only the per-message
+// _mapRoomChatToGroupChat: fires and it returns nil (the fork). So the rename is
+// handled on the incoming-message path and the visible break is on send. v5.3.0
+// hooks didReceiveMessage:forChat:style: and sendMessage:toChat:style: and
+// PROBES the IMDChat (guid/groupID/roomName/identifier/...) to find whether a
+// stable group key ever reaches iOS 6, and what identity it stamps on sends.
 // -----------------------------------------------------------------------------
 // v5.2.0 still crashed (fault @0x22, same incoming path) even though logging was
 // vm_read-guarded -- because the hook params/return were typed `id`, and ARC
@@ -151,41 +159,68 @@ static NSString *GCDict(const void *p) {
     return @"(no-dict)";
 }
 
+// Probe a (verified) object for the identity getters that might carry a stable
+// group key. Each call is guarded by respondsToSelector: and the result is run
+// back through GCSafe (so a non-object/garbage return can't crash us either).
+static NSString *GCProbe(const void *p) {
+    if (!GCIsObjectPtr(p)) return @"(not-obj)";
+    id o = (__bridge id)p;
+    static const char *sels[] = {
+        "guid", "groupID", "groupChatIdentifier", "roomName", "identifier",
+        "chatIdentifier", "name", "displayName", "service", "participants", NULL
+    };
+    NSMutableString *s = [NSMutableString string];
+    for (int i = 0; sels[i]; i++) {
+        SEL sel = sel_getUid(sels[i]);
+        @try {
+            if ([o respondsToSelector:sel]) {
+                id v = ((id(*)(id, SEL))objc_msgSend)(o, sel);
+                [s appendFormat:@"%s=%@ | ", sels[i], GCSafe((__bridge const void *)v)];
+            }
+        } @catch (__unused id e) {}
+    }
+    return s.length ? s : @"(no-known-getters)";
+}
+
 // ===========================================================================
 // RENAME / GROUP-CHANGE / ROOM-MAPPING hooks — read-only, fully guarded.
 // ===========================================================================
 // NOTE: every object argument and the captured return are typed `void *`, never
 // `id`, so ARC cannot emit retain/release (= isa deref) on a possible non-object.
+
+// RECEIVE — the decisive hook. We dump the incoming message and, crucially,
+// PROBE the IMDChat it lands in for any stable group key (guid/groupID/...).
+// This answers: does iOS 6 ever receive a group identifier after a rename?
+static void (*orig_didRecv)(id, SEL, void *, void *, int);
+static void gc_didRecv(id self, SEL _cmd, void *msg, void *chat, int style) {
+    @try {
+        GCLOGB(@"RECV style=%d\n    chat.probe=%@\n    chat.dict=%@\n    msg=%@",
+               style, GCProbe(chat), GCDict(chat), GCSafe(msg));
+    } @catch (__unused id e) {}
+    orig_didRecv(self, _cmd, msg, chat, style);
+}
+
+// SEND — what identity does iOS 6 stamp on an outgoing group message? That is
+// what modern recipients fail to thread back into the renamed group.
+static void (*orig_sendMsg)(id, SEL, void *, void *, int);
+static void gc_sendMsg(id self, SEL _cmd, void *msg, void *chat, int style) {
+    @try {
+        GCLOGB(@"SEND style=%d\n    chat.probe=%@\n    chat.dict=%@",
+               style, GCProbe(chat), GCDict(chat));
+    } @catch (__unused id e) {}
+    orig_sendMsg(self, _cmd, msg, chat, style);
+}
+
+// renameGroup:to: + useChatRoom: kept as cheap insurance (they fire only if the
+// iOS 6 device itself initiates the change; observed NOT to fire on an incoming
+// rename, but harmless to keep watching).
 static void (*orig_renameGroup)(id, SEL, void *, void *);
 static void gc_renameGroup(id self, SEL _cmd, void *group, void *name) {
-    @try { GCLOGB(@"*** RENAME group=%@ to=%@ dict=%@", GCSafe(group), GCSafe(name), GCDict(group)); }
+    @try { GCLOGB(@"*** RENAME group.probe=%@ to=%@", GCProbe(group), GCSafe(name)); }
     @catch (__unused id e) {}
     orig_renameGroup(self, _cmd, group, name);
 }
 
-static void (*orig_changeGroup)(id, SEL, void *, void *);
-static void gc_changeGroup(id self, SEL _cmd, void *group, void *changes) {
-    @try { GCLOGB(@"*** CHANGEGROUP group=%@ changes=%@", GCSafe(group), GCSafe(changes)); }
-    @catch (__unused id e) {}
-    orig_changeGroup(self, _cmd, group, changes);
-}
-
-static void (*orig_changeGroups)(id, SEL, void *);
-static void gc_changeGroups(id self, SEL _cmd, void *groups) {
-    @try { GCLOGB(@"*** CHANGEGROUPS %@", GCSafe(groups)); }
-    @catch (__unused id e) {}
-    orig_changeGroups(self, _cmd, groups);
-}
-
-static void * (*orig_mapRoom)(id, SEL, void *, int);
-static void * gc_mapRoom(id self, SEL _cmd, void *room, int style) {
-    void *r = orig_mapRoom(self, _cmd, room, style);
-    @try { GCLOGB(@"MAPROOM room=%@ style=%d => %@", GCSafe(room), style, GCSafe(r)); }
-    @catch (__unused id e) {}
-    return r;
-}
-
-// useChatRoom:forGroupChatIdentifier: establishes the room<->group link on rename.
 static void (*orig_useRoom)(id, SEL, void *, void *);
 static void gc_useRoom(id self, SEL _cmd, void *room, void *groupId) {
     @try { GCLOGB(@"*** USEROOM room=%@ forGroupChatIdentifier=%@", GCSafe(room), GCSafe(groupId)); }
@@ -208,17 +243,15 @@ static BOOL GCHook1(NSString *cn, SEL sel, IMP repl, void *slot, const char *tag
 %ctor {
     @autoreleasepool {
         GCBuildClassList();
-        GCLog(@"=== GroupChatNameFix 5.2.1-safehunt (vm_read-guarded, void* args) loaded in %@ (classes=%d) ===",
+        GCLog(@"=== GroupChatNameFix 5.3.0-safehunt (recv+send chat probe) loaded in %@ (classes=%d) ===",
               [[NSProcessInfo processInfo] processName], gClassCount);
         NSString *S = @"IMDServiceSession";
+        GCHook1(S, @selector(didReceiveMessage:forChat:style:),
+                (IMP)gc_didRecv, &orig_didRecv, "recv");
+        GCHook1(S, @selector(sendMessage:toChat:style:),
+                (IMP)gc_sendMsg, &orig_sendMsg, "send");
         GCHook1(S, @selector(renameGroup:to:),
                 (IMP)gc_renameGroup, &orig_renameGroup, "rename");
-        GCHook1(S, @selector(changeGroup:changes:),
-                (IMP)gc_changeGroup, &orig_changeGroup, "change");
-        GCHook1(S, @selector(changeGroups:),
-                (IMP)gc_changeGroups, &orig_changeGroups, "changes");
-        GCHook1(S, @selector(_mapRoomChatToGroupChat:style:),
-                (IMP)gc_mapRoom, &orig_mapRoom, "maproom");
         GCHook1(S, @selector(useChatRoom:forGroupChatIdentifier:),
                 (IMP)gc_useRoom, &orig_useRoom, "useroom");
     }
