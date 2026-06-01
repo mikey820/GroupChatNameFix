@@ -28,7 +28,7 @@ jobs:
           git clone --recursive https://github.com/theos/theos.git $THEOS
           curl -L https://github.com/theos/sdks/archive/refs/heads/master.tar.gz -o /tmp/sdks.tar.gz
           mkdir -p $THEOS/sdks
-          tar -xf /tmp/sdks.tar.gz -C $THEOS/sdks --strip-components=1 sdks-master/iPhoneOS9.3.sdk
+          tar -xf /tmp/sdks.tar.gz -C $THEOS/sdks --strip-components=1 sdks-master/iPhoneOS14.5.sdk
           ls $THEOS/sdks
 
       - name: Install toolchain (Linux ARM)
