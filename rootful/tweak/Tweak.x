@@ -353,51 +353,29 @@ static void gc_routing(id self, SEL _cmd, void *msgGUID, void *chatGUID, void *e
     orig_routing(self, _cmd, msgGUID, chatGUID, err);
 }
 
-// Broad hunt across ALL classes for the decryption/verify routine (so we can
-// force-decrypt the c=190 the server sent iOS6 about the renamed group).
-static void GCHuntDecrypt(void) {
-    int n = objc_getClassList(NULL, 0);
-    if (n <= 0) return;
-    Class *cls = (Class *)malloc(sizeof(Class) * n);
-    if (!cls) return;
-    n = objc_getClassList(cls, n);
-    int hits = 0;
-    for (int i = 0; i < n; i++) {
-        const char *cn = class_getName(cls[i]);
+// Dump EVERY method of a class chain (to find a gid/gv injection point on FZMessage).
+static void GCDumpClass(NSString *clsName) {
+    Class c = NSClassFromString(clsName);
+    if (!c) { GCLog(@"DUMP no class %@", clsName); return; }
+    for (Class cur = c; cur && cur != [NSObject class]; cur = class_getSuperclass(cur)) {
         unsigned int mc = 0;
-        Method *ms = class_copyMethodList(cls[i], &mc);
-        for (unsigned int j = 0; j < mc; j++) {
-            const char *nm = sel_getName(method_getName(ms[j]));
-            if (strstr(nm, "ecrypt") || strstr(nm, "ncrypt") ||
-                strstr(nm, "erifySignature") || strstr(nm, "erifyMessage") ||
-                strstr(nm, "ipherData")) {
-                GCLOGB(@"  XMETH %s :: %s", cn, nm);
-                hits++;
-            }
-        }
+        Method *ms = class_copyMethodList(cur, &mc);
+        for (unsigned int j = 0; j < mc; j++)
+            GCLOGB(@"  M %s :: %s", class_getName(cur), sel_getName(method_getName(ms[j])));
         if (ms) free(ms);
+        GCLog(@"  --- end %s ---", class_getName(cur));
     }
-    free(cls);
-    GCLog(@"XMETH hunt done (%d hits)", hits);
 }
 
-// RAW PUSH INTAKE — APSConnection _deliverMessage: is the chokepoint every
-// incoming push passes through before any iMessage logic. We dump topic+userInfo
-// so a live rename reveals whether a control push for the renamed group is even
-// delivered to iOS6 (answering: is the rename network request addressed to us?).
-static void (*orig_deliver)(id, SEL, void *);
-static void gc_deliver(id self, SEL _cmd, void *msg) {
+// SEND-PROCESS — where iOS6 finalizes a message for the wire. Dump it to learn
+// the body shape and whether we can add gid/gv before encryption.
+static void (*orig_procSend)(id, SEL, void *, void *, int, void *);
+static void gc_procSend(id self, SEL _cmd, void *msg, void *chat, int style, void *blk) {
     @try {
-        if (GCIsObjectPtr(msg)) {
-            id m = (__bridge id)msg;
-            void *tp = [m respondsToSelector:@selector(topic)]
-                       ? ((void *(*)(id, SEL))objc_msgSend)(m, @selector(topic)) : NULL;
-            void *ui = [m respondsToSelector:@selector(userInfo)]
-                       ? ((void *(*)(id, SEL))objc_msgSend)(m, @selector(userInfo)) : NULL;
-            GCLOGB(@"PUSH topic=%@\n    userInfo=%@", GCSafe(tp), GCSafe(ui));
-        }
+        GCLOGB(@"PROCSEND style=%d chat=%@\n    msg<%@> dict=%@",
+               style, GCSafe(chat), GCClass(msg), GCDict(msg));
     } @catch (__unused id e) {}
-    orig_deliver(self, _cmd, msg);
+    orig_procSend(self, _cmd, msg, chat, style, blk);
 }
 
 // ---------------------------------------------------------------------------
@@ -415,12 +393,12 @@ static BOOL GCHook1(NSString *cn, SEL sel, IMP repl, void *slot, const char *tag
 %ctor {
     @autoreleasepool {
         GCBuildClassList();
-        GCLog(@"=== GroupChatNameFix 5.15.0-decrypthunt (find decryption seam) loaded in %@ (classes=%d) ===",
+        GCLog(@"=== GroupChatNameFix 5.16.0-injhunt (find gid/gv injection point) loaded in %@ (classes=%d) ===",
               [[NSProcessInfo processInfo] processName], gClassCount);
-        GCHuntDecrypt();
-        GCHook1(@"APSConnection", @selector(_deliverMessage:),
-                (IMP)gc_deliver, &orig_deliver, "push");
+        GCDumpClass(@"FZMessage");
         NSString *S = @"IMDServiceSession";
+        GCHook1(S, @selector(processMessageForSending:toChat:style:completionBlock:),
+                (IMP)gc_procSend, &orig_procSend, "procsend");
         GCHook1(S, @selector(didReceiveMessage:forChat:style:),
                 (IMP)gc_didRecv, &orig_didRecv, "recv");
         GCHook1(S, @selector(sendMessage:toChat:style:),
