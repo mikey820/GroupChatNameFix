@@ -353,6 +353,38 @@ static void gc_routing(id self, SEL _cmd, void *msgGUID, void *chatGUID, void *e
     orig_routing(self, _cmd, msgGUID, chatGUID, err);
 }
 
+// Enumerate the iMessage engine internals (IMD*/Madrid/IDS classes) for the
+// decrypt + command-dispatch seam, so we can see/handle the c=190 rename payload.
+static void GCHuntEngine(void) {
+    int n = objc_getClassList(NULL, 0);
+    if (n <= 0) return;
+    Class *cls = (Class *)malloc(sizeof(Class) * n);
+    if (!cls) return;
+    n = objc_getClassList(cls, n);
+    int hits = 0;
+    for (int i = 0; i < n; i++) {
+        const char *cn = class_getName(cls[i]);
+        if (!(strstr(cn, "IMD") || strstr(cn, "Madrid") || strstr(cn, "IDS") ||
+              strstr(cn, "iMessage") || strstr(cn, "Daemon"))) continue;
+        unsigned int mc = 0;
+        Method *ms = class_copyMethodList(cls[i], &mc);
+        for (unsigned int j = 0; j < mc; j++) {
+            const char *nm = sel_getName(method_getName(ms[j]));
+            if (strstr(nm, "ecrypt") || strstr(nm, "ncoming") || strstr(nm, "ommand") ||
+                strstr(nm, "ushMessage") || strstr(nm, "ushNotification") ||
+                strstr(nm, "ecode") || strstr(nm, "opic") || strstr(nm, "rocessMessage") ||
+                strstr(nm, "essageForTopic") || strstr(nm, "eceivedMessage") ||
+                strstr(nm, "DSMessage")) {
+                GCLOGB(@"  EMETH %s :: %s", cn, nm);
+                hits++;
+            }
+        }
+        if (ms) free(ms);
+    }
+    free(cls);
+    GCLog(@"EMETH hunt done (%d hits)", hits);
+}
+
 // RAW PUSH INTAKE — APSConnection _deliverMessage: is the chokepoint every
 // incoming push passes through before any iMessage logic. We dump topic+userInfo
 // so a live rename reveals whether a control push for the renamed group is even
@@ -387,8 +419,9 @@ static BOOL GCHook1(NSString *cn, SEL sel, IMP repl, void *slot, const char *tag
 %ctor {
     @autoreleasepool {
         GCBuildClassList();
-        GCLog(@"=== GroupChatNameFix 5.11.0-pushcap (dump raw APS pushes) loaded in %@ (classes=%d) ===",
+        GCLog(@"=== GroupChatNameFix 5.12.0-engine (find decrypt/command seam) loaded in %@ (classes=%d) ===",
               [[NSProcessInfo processInfo] processName], gClassCount);
+        GCHuntEngine();
         GCHook1(@"APSConnection", @selector(_deliverMessage:),
                 (IMP)gc_deliver, &orig_deliver, "push");
         NSString *S = @"IMDServiceSession";
