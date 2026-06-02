@@ -374,6 +374,39 @@ static void * gc_bodyForMsg(id self, SEL _cmd, void *m) {
     return r;
 }
 
+// Hunt the whole runtime for the outgoing wire-body / serialization builder
+// (the imagent step that turns an FZMessage into the Madrid bplist before
+// encryption — the only place we could inject gid/gv).
+static void GCHuntWire(void) {
+    int n = objc_getClassList(NULL, 0);
+    if (n <= 0) return;
+    Class *cls = (Class *)malloc(sizeof(Class) * n);
+    if (!cls) return;
+    n = objc_getClassList(cls, n);
+    int hits = 0;
+    for (int i = 0; i < n; i++) {
+        const char *cn = class_getName(cls[i]);
+        unsigned int mc = 0;
+        Method *ms = class_copyMethodList(cls[i], &mc);
+        for (unsigned int j = 0; j < mc; j++) {
+            const char *nm = sel_getName(method_getName(ms[j]));
+            if (strstr(nm, "ictionaryForSending") || strstr(nm, "endingDictionary") ||
+                strstr(nm, "ushPayload")  || strstr(nm, "ushData") ||
+                strstr(nm, "odyForSending")|| strstr(nm, "essageBodyData") ||
+                strstr(nm, "erializedMessage") || strstr(nm, "ncodeForSending") ||
+                strstr(nm, "essageDictionaryFor") || strstr(nm, " adridDictionary") ||
+                strstr(nm, "outgoingDictionary") || strstr(nm, "ataForMessage") ||
+                strstr(nm, "ictionaryRepresentationForSending")) {
+                GCLOGB(@"  WMETH %s :: %s", cn, nm);
+                hits++;
+            }
+        }
+        if (ms) free(ms);
+    }
+    free(cls);
+    GCLog(@"WMETH hunt done (%d hits)", hits);
+}
+
 // ---------------------------------------------------------------------------
 static BOOL GCHook1(NSString *cn, SEL sel, IMP repl, void *slot, const char *tag) {
     Class c = NSClassFromString(cn);
@@ -389,10 +422,10 @@ static BOOL GCHook1(NSString *cn, SEL sel, IMP repl, void *slot, const char *tag
 %ctor {
     @autoreleasepool {
         GCBuildClassList();
-        GCLog(@"=== GroupChatNameFix 5.17.0-wirebody (dump FT _bodyForMessage:) loaded in %@ (classes=%d) ===",
+        GCLog(@"=== GroupChatNameFix 5.18.0-wirehunt (find outgoing body builder) loaded in %@ (classes=%d) ===",
               [[NSProcessInfo processInfo] processName], gClassCount);
-        GCHook1(@"FTMessageDelivery_APS", @selector(_bodyForMessage:),
-                (IMP)gc_bodyForMsg, &orig_bodyForMsg, "bodyformsg");
+        GCHuntWire();
+        (void)gc_bodyForMsg; (void)orig_bodyForMsg;
         NSString *S = @"IMDServiceSession";
         GCHook1(S, @selector(processMessageForSending:toChat:style:completionBlock:),
                 (IMP)gc_procSend, &orig_procSend, "procsend");
