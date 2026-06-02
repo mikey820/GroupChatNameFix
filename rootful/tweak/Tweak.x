@@ -368,11 +368,9 @@ static void GCHuntDecrypt(void) {
         Method *ms = class_copyMethodList(cls[i], &mc);
         for (unsigned int j = 0; j < mc; j++) {
             const char *nm = sel_getName(method_getName(ms[j]));
-            if (strstr(nm, "ecryptMessage") || strstr(nm, "ecryptBody") ||
-                strstr(nm, "ecryptData")    || strstr(nm, "ecryptPayload") ||
-                strstr(nm, "erifyAndDecrypt")|| strstr(nm, "ecryptAndVerify") ||
-                strstr(nm, "ecodeMessageBody")|| strstr(nm, "ncryptedBody") ||
-                strstr(nm, "essageFromEncrypted") || strstr(nm, "ecryptIncoming")) {
+            if (strstr(nm, "ecrypt") || strstr(nm, "ncrypt") ||
+                strstr(nm, "erifySignature") || strstr(nm, "erifyMessage") ||
+                strstr(nm, "ipherData")) {
                 GCLOGB(@"  XMETH %s :: %s", cn, nm);
                 hits++;
             }
