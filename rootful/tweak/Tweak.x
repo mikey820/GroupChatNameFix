@@ -368,6 +368,36 @@ static void GCDumpClass(NSString *clsName) {
     }
 }
 
+// Broad hunt across ALL classes for the decryption/verify routine (so we can
+// force-decrypt the c=190 the server sent iOS6 about the renamed group).
+static void GCHuntDecrypt(void) {
+    int n = objc_getClassList(NULL, 0);
+    if (n <= 0) return;
+    Class *cls = (Class *)malloc(sizeof(Class) * n);
+    if (!cls) return;
+    n = objc_getClassList(cls, n);
+    int hits = 0;
+    for (int i = 0; i < n; i++) {
+        const char *cn = class_getName(cls[i]);
+        unsigned int mc = 0;
+        Method *ms = class_copyMethodList(cls[i], &mc);
+        for (unsigned int j = 0; j < mc; j++) {
+            const char *nm = sel_getName(method_getName(ms[j]));
+            if (strstr(nm, "ecryptMessage") || strstr(nm, "ecryptBody") ||
+                strstr(nm, "ecryptData")    || strstr(nm, "ecryptPayload") ||
+                strstr(nm, "erifyAndDecrypt")|| strstr(nm, "ecryptAndVerify") ||
+                strstr(nm, "ecodeMessageBody")|| strstr(nm, "ncryptedBody") ||
+                strstr(nm, "essageFromEncrypted") || strstr(nm, "ecryptIncoming")) {
+                GCLOGB(@"  XMETH %s :: %s", cn, nm);
+                hits++;
+            }
+        }
+        if (ms) free(ms);
+    }
+    free(cls);
+    GCLog(@"XMETH hunt done (%d hits)", hits);
+}
+
 // RAW PUSH INTAKE — APSConnection _deliverMessage: is the chokepoint every
 // incoming push passes through before any iMessage logic. We dump topic+userInfo
 // so a live rename reveals whether a control push for the renamed group is even
@@ -402,27 +432,9 @@ static BOOL GCHook1(NSString *cn, SEL sel, IMP repl, void *slot, const char *tag
 %ctor {
     @autoreleasepool {
         GCBuildClassList();
-        GCLog(@"=== GroupChatNameFix 5.14.0-ftlayer (dump FT delivery + FTIDSMessage) loaded in %@ (classes=%d) ===",
+        GCLog(@"=== GroupChatNameFix 5.15.0-decrypthunt (find decryption seam) loaded in %@ (classes=%d) ===",
               [[NSProcessInfo processInfo] processName], gClassCount);
-        GCDumpClass(@"FTMessageDelivery_APS");
-        GCDumpClass(@"FTIDSMessage");
-        // global hunt: the FT->IMD delegate delivery method
-        {
-            int n = objc_getClassList(NULL, 0);
-            Class *cl = (Class *)malloc(sizeof(Class) * n); n = objc_getClassList(cl, n);
-            for (int i = 0; i < n; i++) {
-                unsigned int mc = 0; Method *ms = class_copyMethodList(cl[i], &mc);
-                for (unsigned int j = 0; j < mc; j++) {
-                    const char *nm = sel_getName(method_getName(ms[j]));
-                    if (strstr(nm, "essageDelivery") || strstr(nm, "idReceiveIncoming") ||
-                        strstr(nm, "idReceiveMessages") || strstr(nm, "ncomingMessageFromIDS") ||
-                        strstr(nm, "elivery:didReceive"))
-                        GCLOGB(@"  DMETH %s :: %s", class_getName(cl[i]), nm);
-                }
-                if (ms) free(ms);
-            }
-            free(cl); GCLog(@"DMETH hunt done");
-        }
+        GCHuntDecrypt();
         GCHook1(@"APSConnection", @selector(_deliverMessage:),
                 (IMP)gc_deliver, &orig_deliver, "push");
         NSString *S = @"IMDServiceSession";
