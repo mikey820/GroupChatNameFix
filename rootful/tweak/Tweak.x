@@ -353,20 +353,6 @@ static void gc_routing(id self, SEL _cmd, void *msgGUID, void *chatGUID, void *e
     orig_routing(self, _cmd, msgGUID, chatGUID, err);
 }
 
-// Dump EVERY method of a class chain (to find a gid/gv injection point on FZMessage).
-static void GCDumpClass(NSString *clsName) {
-    Class c = NSClassFromString(clsName);
-    if (!c) { GCLog(@"DUMP no class %@", clsName); return; }
-    for (Class cur = c; cur && cur != [NSObject class]; cur = class_getSuperclass(cur)) {
-        unsigned int mc = 0;
-        Method *ms = class_copyMethodList(cur, &mc);
-        for (unsigned int j = 0; j < mc; j++)
-            GCLOGB(@"  M %s :: %s", class_getName(cur), sel_getName(method_getName(ms[j])));
-        if (ms) free(ms);
-        GCLog(@"  --- end %s ---", class_getName(cur));
-    }
-}
-
 // SEND-PROCESS — where iOS6 finalizes a message for the wire. Dump it to learn
 // the body shape and whether we can add gid/gv before encryption.
 static void (*orig_procSend)(id, SEL, void *, void *, int, void *);
