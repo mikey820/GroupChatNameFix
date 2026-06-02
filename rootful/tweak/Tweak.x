@@ -353,21 +353,6 @@ static void gc_routing(id self, SEL _cmd, void *msgGUID, void *chatGUID, void *e
     orig_routing(self, _cmd, msgGUID, chatGUID, err);
 }
 
-// Dump EVERY method of named classes (and superclasses) to find the incoming
-// decrypted-message delivery seam (where c=190 arrives at imagent's session).
-static void GCDumpClass(NSString *clsName) {
-    Class c = NSClassFromString(clsName);
-    if (!c) { GCLog(@"DUMP no class %@", clsName); return; }
-    for (Class cur = c; cur && cur != [NSObject class]; cur = class_getSuperclass(cur)) {
-        unsigned int mc = 0;
-        Method *ms = class_copyMethodList(cur, &mc);
-        for (unsigned int j = 0; j < mc; j++)
-            GCLOGB(@"  M %s :: %s", class_getName(cur), sel_getName(method_getName(ms[j])));
-        if (ms) free(ms);
-        GCLog(@"  --- end %s ---", class_getName(cur));
-    }
-}
-
 // Broad hunt across ALL classes for the decryption/verify routine (so we can
 // force-decrypt the c=190 the server sent iOS6 about the renamed group).
 static void GCHuntDecrypt(void) {
