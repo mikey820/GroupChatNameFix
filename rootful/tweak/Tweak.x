@@ -402,9 +402,27 @@ static BOOL GCHook1(NSString *cn, SEL sel, IMP repl, void *slot, const char *tag
 %ctor {
     @autoreleasepool {
         GCBuildClassList();
-        GCLog(@"=== GroupChatNameFix 5.13.0-bridge (dump IMDAppleServiceSession) loaded in %@ (classes=%d) ===",
+        GCLog(@"=== GroupChatNameFix 5.14.0-ftlayer (dump FT delivery + FTIDSMessage) loaded in %@ (classes=%d) ===",
               [[NSProcessInfo processInfo] processName], gClassCount);
-        GCDumpClass(@"IMDAppleServiceSession");
+        GCDumpClass(@"FTMessageDelivery_APS");
+        GCDumpClass(@"FTIDSMessage");
+        // global hunt: the FT->IMD delegate delivery method
+        {
+            int n = objc_getClassList(NULL, 0);
+            Class *cl = (Class *)malloc(sizeof(Class) * n); n = objc_getClassList(cl, n);
+            for (int i = 0; i < n; i++) {
+                unsigned int mc = 0; Method *ms = class_copyMethodList(cl[i], &mc);
+                for (unsigned int j = 0; j < mc; j++) {
+                    const char *nm = sel_getName(method_getName(ms[j]));
+                    if (strstr(nm, "essageDelivery") || strstr(nm, "idReceiveIncoming") ||
+                        strstr(nm, "idReceiveMessages") || strstr(nm, "ncomingMessageFromIDS") ||
+                        strstr(nm, "elivery:didReceive"))
+                        GCLOGB(@"  DMETH %s :: %s", class_getName(cl[i]), nm);
+                }
+                if (ms) free(ms);
+            }
+            free(cl); GCLog(@"DMETH hunt done");
+        }
         GCHook1(@"APSConnection", @selector(_deliverMessage:),
                 (IMP)gc_deliver, &orig_deliver, "push");
         NSString *S = @"IMDServiceSession";
