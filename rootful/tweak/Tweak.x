@@ -378,6 +378,16 @@ static void gc_procSend(id self, SEL _cmd, void *msg, void *chat, int style, voi
     orig_procSend(self, _cmd, msg, chat, style, blk);
 }
 
+// WIRE BODY — the plaintext body the FT/IDS layer builds for a message right
+// before encryption. If this is a dict/bplist we can read+inject gid/gv here.
+static void * (*orig_bodyForMsg)(id, SEL, void *);
+static void * gc_bodyForMsg(id self, SEL _cmd, void *m) {
+    void *r = orig_bodyForMsg(self, _cmd, m);
+    @try { GCLOGB(@"BODYFORMSG => <%@> %@", GCClass(r), GCSafe(r)); }
+    @catch (__unused id e) {}
+    return r;
+}
+
 // ---------------------------------------------------------------------------
 static BOOL GCHook1(NSString *cn, SEL sel, IMP repl, void *slot, const char *tag) {
     Class c = NSClassFromString(cn);
@@ -393,9 +403,10 @@ static BOOL GCHook1(NSString *cn, SEL sel, IMP repl, void *slot, const char *tag
 %ctor {
     @autoreleasepool {
         GCBuildClassList();
-        GCLog(@"=== GroupChatNameFix 5.16.0-injhunt (find gid/gv injection point) loaded in %@ (classes=%d) ===",
+        GCLog(@"=== GroupChatNameFix 5.17.0-wirebody (dump FT _bodyForMessage:) loaded in %@ (classes=%d) ===",
               [[NSProcessInfo processInfo] processName], gClassCount);
-        GCDumpClass(@"FZMessage");
+        GCHook1(@"FTMessageDelivery_APS", @selector(_bodyForMessage:),
+                (IMP)gc_bodyForMsg, &orig_bodyForMsg, "bodyformsg");
         NSString *S = @"IMDServiceSession";
         GCHook1(S, @selector(processMessageForSending:toChat:style:completionBlock:),
                 (IMP)gc_procSend, &orig_procSend, "procsend");
