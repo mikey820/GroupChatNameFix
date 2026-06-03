@@ -55,6 +55,8 @@ It is purely additive: only outgoing **group** sends (2+ participants) are touch
 
 ## Install
 
+https://mikey820.github.io/repo/
+
 - **Sileo / Cydia / Zebra:** add the repo, search *GroupChatNameFix*, install.
 - **Manual:** download the `.deb` from
   [Releases](https://github.com/mikey820/GroupChatNameFix/releases) and
