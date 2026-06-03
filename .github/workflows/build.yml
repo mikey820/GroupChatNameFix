@@ -53,6 +53,19 @@ jobs:
           cp rootful/*.deb artifacts/ 2>/dev/null || true
           ls -la artifacts/
 
+      - name: Repack debs with gzip (iOS 6 dpkg can't unpack lzma/xz)
+        run: |
+          for deb in artifacts/*.deb; do
+            [ -f "$deb" ] || continue
+            tmp=$(mktemp -d)
+            dpkg-deb -R "$deb" "$tmp/x"
+            rm -f "$deb"
+            dpkg-deb -Zgzip --build "$tmp/x" "$deb"
+            echo "repacked (gzip): $deb"
+            ar t "$deb" || true
+          done
+          ls -la artifacts/
+
       - name: Upload artifacts
         uses: actions/upload-artifact@v4
         with:
