@@ -163,6 +163,7 @@ static void gc_mdc_send(id self, SEL _cmd,
                         void *toSessionToken, void *toPeople, void *ackBlock,
                         void *completionBlock) {
     void *dictToUse = messageDictionary;
+    id injected = nil;   // strong holder: keeps the substituted dict alive through orig call
     @try {
         int npeople = 0;
         if (GCIsObjectPtr(toPeople)) {
@@ -179,11 +180,12 @@ static void gc_mdc_send(id self, SEL _cmd,
             if (npeople >= minp) {
                 id orig = (__bridge id)messageDictionary;
                 if ([orig respondsToSelector:@selector(mutableCopy)]) {
-                    NSMutableDictionary *md = [orig mutableCopy];   // +1, autorelease below
+                    NSMutableDictionary *md = [orig mutableCopy];
                     md[@"gid"] = cfg[@"gid"];
                     md[@"gv"]  = cfg[@"gv"] ?: @"8";
                     if (cfg[@"n"]) md[@"n"] = cfg[@"n"];
-                    dictToUse = (__bridge void *)[md autorelease];  // valid for the synchronous orig call
+                    injected = md;                       // strong ref (method scope) keeps it alive
+                    dictToUse = (__bridge void *)md;
                     GCLOGB(@"INJECT gid=%@ gv=%@ n=%@ -> %@",
                            cfg[@"gid"], md[@"gv"], cfg[@"n"] ?: @"(none)", md);
                 }
@@ -192,6 +194,7 @@ static void gc_mdc_send(id self, SEL _cmd,
     } @catch (__unused id e) {}
     orig_mdc_send(self, _cmd, message, messageString, dictToUse, fromID, fromIdentity,
                   toID, toToken, toSessionToken, toPeople, ackBlock, completionBlock);
+    (void)injected;   // kept alive across the orig call above
 }
 
 // ===========================================================================
