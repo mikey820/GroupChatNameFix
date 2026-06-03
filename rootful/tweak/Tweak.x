@@ -1,38 +1,34 @@
 // GroupChatNameFix - iOS 6 (armv7s) tweak for imagent / iMessage.imservice
 //
-// v6.0.0 - BREAKTHROUGH via static RE of the dyld_shared_cache.
+// v6.1.0 - SELF-CONTAINED autonomous fix (no companion device, no manual config).
 // -----------------------------------------------------------------------------
-// The long-held belief that iOS6's outgoing Madrid wire-body is built in C (no
-// ObjC seam) was WRONG. Disassembling iMessage.imservice from the shared cache
-// shows the real send path:
+// v6.0.0 PROVED (real-hw dev35 sms.db ROWID A/B) that injecting gid+gv=8 into the
+// outgoing Madrid payload threads iOS6's group messages into the modern named
+// group instead of forking them. The send seam is:
+//   -[MessageDeliveryController _sendMessage:messageString:messageDictionary:..]
+//   -> _JWEncodeDictionary(messageDictionary) -> gzip -> encrypt -> APS
+// iOS6's payload is {p=(participants); t=text; v=1} with NO gid.
 //
-//   -[MessageServiceSession sendMessage:toChat:style:]
-//     -> -[MessageDeliveryController sendMessage:toPeople:fromID:fromIdentity:..]
-//       -> -[MessageDeliveryController _sendMessage:...:type:..]
-//         -> -[MessageDeliveryController _sendMessage:messageString:
-//                messageDictionary:fromID:fromIdentity:toID:toToken:
-//                toSessionToken:toPeople:ackBlock:completionBlock:]
-//              messageDictionary  --_JWEncodeDictionary-->  gzip --> encrypt --> APS
+// The only open question was WHERE iOS6 gets the group's gid (it's not in the
+// FZMessage, and the rename c=190 is encrypted/ignored). ANSWER (from RE of the
+// incoming path): every inbound message is decoded by the EXPORTED C function
+//   id JWDecodeDictionary(NSData *plaintext)   // IMFoundation
+// called from -[MessageServiceSession _handler:incomingMessage:...]. Decryption
+// is end-to-end, so iOS6 receives EXACTLY what the modern sender encrypted -
+// including gid/gv (the stripping only happens later, at FZMessage). So:
 //
-// `messageDictionary` is the PLAINTEXT Madrid payload, a normal NSDictionary,
-// passed into an ObjC method immediately before serialization. iOS6's payload
-// vocabulary (from __cfstring): c,p,guid,name,Group,v,t,x,s,u,from,to,pair/otr.
-// It has NO `gid`/`gv` -- the keys modern iOS uses to thread NAMED groups. We
-// inject them here: drop a mutable copy of messageDictionary carrying
-// gid=<group UUID> + gv=8 so iOS6's encrypted payload looks like a modern named
-// -group member's, and modern devices thread it into the renamed group instead
-// of forking it.
+//   HARVEST: MSHookFunction JWDecodeDictionary; when an inbound dict has gid+p,
+//            learn participants->gid and persist to /var/mobile/gcnf_learned.plist
+//   INJECT : on send, look up the learned gid by the outgoing participant set and
+//            add gid+gv=8 to a mutable copy of messageDictionary before encode.
 //
-// Config (read fresh per send, no rebuild needed): /var/mobile/gcnf_gid.txt
-//     gid=2DA6132C-4E52-402E-AC30-577D90B31727
-//     gv=8
-//     n=Bruh                 (optional group name)
-//     minpeople=2            (optional; only inject when toPeople count >= this)
-// Absent/empty file => pure passthrough (clean A/B baseline).
+// Net: once ANY modern member posts to the group, iOS6 self-heals and all its
+// subsequent sends thread correctly - entirely on the iOS6 device.
+// /var/mobile/gcnf_gid.txt (gid=..., gv=..., minpeople=...) still works as a
+// manual override/test forcing a fixed gid for every group send.
 // -----------------------------------------------------------------------------
-// Crash-proofing retained from v5.x: every hook arg is typed `void *` (never id,
-// so ARC emits no retain/release isa-deref on a possible non-object); we only
-// __bridge to id AFTER GCIsObjectPtr validates the isa via vm_read_overwrite.
+// Crash-proofing (v5.x): hook args typed void*, validated via vm_read_overwrite
+// + registered-class check before any objc_msgSend (ARC never sees raw non-objs).
 
 #import <Foundation/Foundation.h>
 #import <objc/message.h>
@@ -40,12 +36,17 @@
 #import <mach/mach.h>
 #import <mach-o/dyld.h>
 #import <dispatch/dispatch.h>
+#import <dlfcn.h>
+#import <pthread.h>
 
 extern void MSHookMessageEx(Class cls, SEL sel, IMP imp, IMP *result);
+extern void MSHookFunction(void *symbol, void *replacement, void **result);
+extern void *MSFindSymbol(void *image, const char *name);
 
-static NSString *const kLogPath = @"/var/mobile/GroupChatNameFix.log";
-static NSString *const kGidPath = @"/var/mobile/gcnf_gid.txt";
-static int gLogBudget = 2000;
+static NSString *const kLogPath     = @"/var/mobile/GroupChatNameFix.log";
+static NSString *const kGidPath     = @"/var/mobile/gcnf_gid.txt";        // manual override
+static NSString *const kLearnedPath = @"/var/mobile/gcnf_learned.plist";  // auto-learned map
+static int gLogBudget = 4000;
 
 static void GCLog(NSString *fmt, ...) {
     va_list ap; va_start(ap, fmt);
@@ -77,7 +78,6 @@ static BOOL GCSafeRead(const void *addr, void *out, size_t len) {
                                          (vm_address_t)out, &got);
     return (kr == KERN_SUCCESS && got == len);
 }
-
 static uintptr_t *gClassPtrs = NULL;
 static int gClassCount = 0;
 static int GCUIntCmp(const void *a, const void *b) {
@@ -110,31 +110,58 @@ static BOOL GCIsObjectPtr(const void *p) {
     if (c < 0x1000) return NO;
     return GCIsRegisteredClass(c);
 }
-static NSString *GCSafe(const void *p) {
-    if (!p) return @"(nil)";
-    if (GCIsObjectPtr(p)) {
-        id o = (__bridge id)p;
-        @try { return [o description] ?: @"(nil-desc)"; }
-        @catch (__unused id e) { return @"(desc-threw)"; }
-    }
-    unsigned char buf[40] = {0};
-    if (GCSafeRead(p, buf, sizeof(buf) - 1)) {
-        char ascii[41]; int n = 0;
-        for (int i = 0; i < (int)sizeof(buf) - 1; i++) {
-            unsigned char ch = buf[i];
-            ascii[n++] = (ch >= 0x20 && ch < 0x7f) ? (char)ch : '.';
-        }
-        ascii[n] = 0;
-        return [NSString stringWithFormat:@"<non-obj %p '%s'>", p, ascii];
-    }
-    return [NSString stringWithFormat:@"<unreadable %p>", p];
-}
 
 // ===========================================================================
-// Config: parse /var/mobile/gcnf_gid.txt fresh on each send (re-pointable over
-// SSH without a rebuild). Returns nil if absent/empty.
+// Learned participants->gid map (persisted), + manual override file.
 // ===========================================================================
-static NSDictionary *GCReadConfig(void) {
+static pthread_mutex_t gLock = PTHREAD_MUTEX_INITIALIZER;
+static NSMutableDictionary *gLearned = nil;   // key=participant-set -> gid
+
+static void GCLoadLearned(void) {
+    if (gLearned) return;
+    NSDictionary *d = [NSDictionary dictionaryWithContentsOfFile:kLearnedPath];
+    gLearned = d ? [d mutableCopy] : [NSMutableDictionary dictionary];
+}
+
+// Normalized key for a participant array: lowercased URIs, sorted, joined.
+static NSString *GCPKey(id parr) {
+    if (!GCIsObjectPtr((__bridge const void *)parr)) return nil;
+    if (![parr respondsToSelector:@selector(count)]) return nil;
+    @try {
+        NSMutableArray *m = [NSMutableArray array];
+        for (id e in (NSArray *)parr)
+            if ([e isKindOfClass:[NSString class]]) [m addObject:[(NSString *)e lowercaseString]];
+        if (m.count == 0) return nil;
+        [m sortUsingSelector:@selector(compare:)];
+        return [m componentsJoinedByString:@"|"];
+    } @catch (__unused id e) { return nil; }
+}
+
+static NSString *GCLookupGid(NSString *key) {
+    if (!key) return nil;
+    NSString *r = nil;
+    pthread_mutex_lock(&gLock);
+    GCLoadLearned();
+    r = gLearned[key];
+    pthread_mutex_unlock(&gLock);
+    return r;
+}
+
+static void GCStoreGid(NSString *key, NSString *gid) {
+    if (!key || !gid) return;
+    pthread_mutex_lock(&gLock);
+    GCLoadLearned();
+    BOOL changed = ![gLearned[key] isEqualToString:gid];
+    if (changed) {
+        gLearned[key] = gid;
+        @try { [gLearned writeToFile:kLearnedPath atomically:YES]; } @catch (__unused id e) {}
+    }
+    pthread_mutex_unlock(&gLock);
+    if (changed) GCLOGB(@"LEARNED gid=%@ for participants=%@", gid, key);
+}
+
+// Manual override: /var/mobile/gcnf_gid.txt with gid=... [gv=...] [minpeople=...]
+static NSDictionary *GCManualOverride(void) {
     NSError *e = nil;
     NSString *cfg = [NSString stringWithContentsOfFile:kGidPath encoding:NSUTF8StringEncoding error:&e];
     if (!cfg || cfg.length == 0) return nil;
@@ -147,16 +174,35 @@ static NSDictionary *GCReadConfig(void) {
         NSString *v = [[raw substringFromIndex:eq.location + 1] stringByTrimmingCharactersInSet:ws];
         if (k.length && v.length) out[k] = v;
     }
-    return out[@"gid"] ? out : nil;   // gid is required
+    return out[@"gid"] ? out : nil;
 }
 
 // ===========================================================================
-// THE HOOK: -[MessageDeliveryController
-//   _sendMessage:messageString:messageDictionary:fromID:fromIdentity:toID:
-//    toToken:toSessionToken:toPeople:ackBlock:completionBlock:]
-// messageDictionary is the plaintext payload, serialized right after this call.
-// We log it, and (if configured + group) substitute a mutable copy carrying
-// gid/gv so modern devices thread the message into the renamed named-group.
+// HARVEST: id JWDecodeDictionary(NSData *plaintext) -- every inbound payload.
+// ===========================================================================
+static void *(*orig_JWDecode)(void *);
+static void *gc_JWDecode(void *data) {
+    void *r = orig_JWDecode(data);
+    @try {
+        if (GCIsObjectPtr(r)) {
+            id d = (__bridge id)r;
+            if ([d isKindOfClass:[NSDictionary class]]) {
+                id gid = [d objectForKey:@"gid"];
+                id p   = [d objectForKey:@"p"];
+                if ([gid isKindOfClass:[NSString class]] && p) {
+                    NSString *key = GCPKey(p);
+                    if (key) GCStoreGid(key, (NSString *)gid);
+                }
+            }
+        }
+    } @catch (__unused id e) {}
+    return r;
+}
+
+// ===========================================================================
+// INJECT: -[MessageDeliveryController _sendMessage:messageString:
+//   messageDictionary:fromID:fromIdentity:toID:toToken:toSessionToken:toPeople:
+//   ackBlock:completionBlock:]
 // ===========================================================================
 static void (*orig_mdc_send)(id, SEL, void *, void *, void *, void *, void *,
                              void *, void *, void *, void *, void *, void *);
@@ -166,64 +212,70 @@ static void gc_mdc_send(id self, SEL _cmd,
                         void *toSessionToken, void *toPeople, void *ackBlock,
                         void *completionBlock) {
     void *dictToUse = messageDictionary;
-    id injected = nil;   // strong holder: keeps the substituted dict alive through orig call
+    id injected = nil;
     @try {
-        int npeople = 0;
-        if (GCIsObjectPtr(toPeople)) {
-            id arr = (__bridge id)toPeople;
-            if ([arr respondsToSelector:@selector(count)])
-                npeople = (int)((NSUInteger(*)(id, SEL))objc_msgSend)(arr, @selector(count));
-        }
-        GCLOGB(@"MDC-SEND people=%d toID=%@\n    toPeople=%@\n    dict=%@",
-               npeople, GCSafe(toID), GCSafe(toPeople), GCSafe(messageDictionary));
+        if (GCIsObjectPtr(messageDictionary)) {
+            id orig = (__bridge id)messageDictionary;
+            id p = [orig respondsToSelector:@selector(objectForKey:)] ? [orig objectForKey:@"p"] : nil;
+            NSString *key = GCPKey(p);
+            int npeople = 0;
+            if ([p respondsToSelector:@selector(count)])
+                npeople = (int)((NSUInteger(*)(id, SEL))objc_msgSend)(p, @selector(count));
 
-        NSDictionary *cfg = GCReadConfig();
-        if (cfg && GCIsObjectPtr(messageDictionary)) {
-            int minp = cfg[@"minpeople"] ? [cfg[@"minpeople"] intValue] : 2;
-            if (npeople >= minp) {
-                id orig = (__bridge id)messageDictionary;
-                if ([orig respondsToSelector:@selector(mutableCopy)]) {
-                    NSMutableDictionary *md = [orig mutableCopy];
-                    md[@"gid"] = cfg[@"gid"];
-                    md[@"gv"]  = cfg[@"gv"] ?: @"8";
-                    if (cfg[@"n"]) md[@"n"] = cfg[@"n"];
-                    injected = md;                       // strong ref (method scope) keeps it alive
-                    dictToUse = (__bridge void *)md;
-                    GCLOGB(@"INJECT gid=%@ gv=%@ n=%@ -> %@",
-                           cfg[@"gid"], md[@"gv"], cfg[@"n"] ?: @"(none)", md);
-                }
+            NSDictionary *ov = GCManualOverride();
+            NSString *gid = nil, *gv = @"8";
+            int minp = 2;
+            if (ov) { gid = ov[@"gid"]; if (ov[@"gv"]) gv = ov[@"gv"]; if (ov[@"minpeople"]) minp = [ov[@"minpeople"] intValue]; }
+            else    { gid = GCLookupGid(key); }
+
+            if (gid && npeople >= minp && [orig respondsToSelector:@selector(mutableCopy)]) {
+                NSMutableDictionary *md = [orig mutableCopy];
+                md[@"gid"] = gid;
+                md[@"gv"]  = gv;
+                injected = md;
+                dictToUse = (__bridge void *)md;
+                GCLOGB(@"INJECT gid=%@ gv=%@ (%@) people=%d", gid, gv, ov ? @"manual" : @"learned", npeople);
+            } else {
+                GCLOGB(@"SEND people=%d key=%@ gid=%@ (no inject)", npeople, key, gid ?: @"(none)");
             }
         }
     } @catch (__unused id e) {}
     orig_mdc_send(self, _cmd, message, messageString, dictToUse, fromID, fromIdentity,
                   toID, toToken, toSessionToken, toPeople, ackBlock, completionBlock);
-    (void)injected;   // kept alive across the orig call above
+    (void)injected;
 }
 
 // ===========================================================================
+static volatile int gBoundSend = 0, gBoundDecode = 0;
 static const char *kMDCSel =
     "_sendMessage:messageString:messageDictionary:fromID:fromIdentity:toID:"
     "toToken:toSessionToken:toPeople:ackBlock:completionBlock:";
 
-// iMessage.imservice (which defines MessageDeliveryController) loads lazily into
-// imagent on first iMessage activity, so the class is absent at %ctor. Bind when
-// it appears: try now, and on every dyld image-load until bound.
-static volatile int gBound = 0;
 static void GCTryBind(void) {
-    if (gBound) return;
-    Class c = objc_getClass("MessageDeliveryController");
-    if (!c) return;
-    SEL sel = sel_getUid(kMDCSel);
-    if (!class_getInstanceMethod(c, sel)) return;
-    gBound = 1;
-    GCBuildClassList();   // rebuild so membership includes the just-loaded plugin classes
-    MSHookMessageEx(c, sel, (IMP)gc_mdc_send, (IMP *)&orig_mdc_send);
-    GCLog(@"HOOKED -[MessageDeliveryController _sendMessage:...messageDictionary:...] (classes=%d)", gClassCount);
+    if (!gBoundSend) {
+        Class c = objc_getClass("MessageDeliveryController");
+        SEL sel = sel_getUid(kMDCSel);
+        if (c && class_getInstanceMethod(c, sel)) {
+            gBoundSend = 1;
+            GCBuildClassList();
+            MSHookMessageEx(c, sel, (IMP)gc_mdc_send, (IMP *)&orig_mdc_send);
+            GCLog(@"HOOKED send -[MessageDeliveryController _sendMessage:...] (classes=%d)", gClassCount);
+        }
+    }
+    if (!gBoundDecode) {
+        void *sym = dlsym(RTLD_DEFAULT, "JWDecodeDictionary");
+        if (!sym) { @try { sym = MSFindSymbol(NULL, "_JWDecodeDictionary"); } @catch (__unused id e) {} }
+        if (sym) {
+            gBoundDecode = 1;
+            MSHookFunction(sym, (void *)gc_JWDecode, (void **)&orig_JWDecode);
+            GCLog(@"HOOKED harvest JWDecodeDictionary @ %p", sym);
+        }
+    }
 }
 static void GCImageAdded(const struct mach_header *mh, intptr_t slide) {
-    if (gBound) return;
+    if (gBoundSend && gBoundDecode) return;
     GCTryBind();
-    if (!gBound)   // objc may register the image's classes just after this callback
+    if (!(gBoundSend && gBoundDecode))
         dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(0.25 * NSEC_PER_SEC)),
                        dispatch_get_global_queue(0, 0), ^{ GCTryBind(); });
 }
@@ -231,11 +283,11 @@ static void GCImageAdded(const struct mach_header *mh, intptr_t slide) {
 %ctor {
     @autoreleasepool {
         GCBuildClassList();
-        GCLog(@"=== GroupChatNameFix 6.0.0 (gid/gv inject) loaded, classes=%d ===", gClassCount);
+        GCLog(@"=== GroupChatNameFix 6.1.0 (autonomous harvest+inject) loaded, classes=%d ===", gClassCount);
         GCTryBind();
-        if (!gBound) {
+        if (!(gBoundSend && gBoundDecode)) {
             _dyld_register_func_for_add_image(GCImageAdded);
-            GCLog(@"MessageDeliveryController not yet loaded; armed dyld image-load watcher");
+            GCLog(@"armed dyld watcher (send=%d decode=%d)", gBoundSend, gBoundDecode);
         }
     }
 }
