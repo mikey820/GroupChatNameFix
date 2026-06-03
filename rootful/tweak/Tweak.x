@@ -227,6 +227,29 @@ static NSString *GCLookupName(NSString *key) {
     return r;
 }
 
+// imagent's participant set ("p") includes the device's OWN handle; ChatKit's
+// recipient list does not. So an exact key match usually fails by exactly the
+// self handle(s). Fall back to the stored key whose number-set is the tightest
+// superset of the on-screen set (the extra members being self).
+static NSString *GCLookupNameSubset(NSString *uiKey) {
+    if (uiKey.length == 0) return nil;
+    NSString *exact = GCLookupName(uiKey);
+    if (exact) return exact;
+    NSSet *uiSet = [NSSet setWithArray:[uiKey componentsSeparatedByString:@"|"]];
+    NSString *best = nil; NSUInteger bestExtra = NSUIntegerMax;
+    pthread_mutex_lock(&gLock);
+    GCLoadNames();
+    for (NSString *sk in gNames) {
+        NSSet *ss = [NSSet setWithArray:[sk componentsSeparatedByString:@"|"]];
+        if (ss.count > uiSet.count && [uiSet isSubsetOfSet:ss]) {
+            NSUInteger extra = ss.count - uiSet.count;
+            if (extra < bestExtra) { bestExtra = extra; best = gNames[sk]; }
+        }
+    }
+    pthread_mutex_unlock(&gLock);
+    return best;
+}
+
 // Manual gid override: /var/mobile/gcnf_gid.txt with gid=... [gv=...] [minpeople=...]
 static NSDictionary *GCManualOverride(void) {
     NSError *e = nil;
@@ -387,7 +410,7 @@ static NSString *GCTitleForConversation(id conv) {
     NSString *forced = GCForceName();
     if (forced) { GCLOGB(@"UI force-name -> %@", forced); return forced; }
     NSString *mk = GCMatchKey(addrs);
-    NSString *nm = GCLookupName(mk);
+    NSString *nm = GCLookupNameSubset(mk);
     GCLOGB(@"UI conv matchkey=%@ name=%@", mk, nm ?: @"(none)");
     return nm;
 }
