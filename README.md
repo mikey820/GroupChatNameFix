@@ -7,7 +7,7 @@ for everyone else once a modern‑iOS member gives the group a name.
 > TL;DR — after someone on modern iOS names (or renames) a group that includes an
 > iOS 6 device, every message the iOS 6 device sends lands in a brand‑new thread for
 > the other members. This tweak makes those messages thread into the real named group
-> again. It is **fully autonomous** — no companion app, no manual configuration.
+> again. It is **fully autonomous**, no companion app, no manual configuration.
 
 ---
 
@@ -25,12 +25,12 @@ only:
 
 No `gid`. So once a group has a name, modern devices can't match iOS 6's gid‑less
 messages to the named group and bucket them by participant set into a **separate
-("forked") thread** instead. iOS 6 itself always looks normal — it only ever has the one
+("forked") thread** instead. iOS 6 itself always looks normal, it only ever has the one
 chat; the split is only visible to the modern recipients.
 
 ## The fix
 
-iOS 6 already receives the `gid` — it's inside every **incoming** group message
+iOS 6 actually already receives the `gid` — it's inside every **incoming** group message
 (decryption is end‑to‑end, so iOS 6 gets exactly what the modern sender encrypted; the
 `gid` is only discarded later, when iOS 6 builds its internal message object). So the
 tweak:
@@ -47,24 +47,11 @@ tweak:
    serialized (`_JWEncodeDictionary`), gzipped and encrypted.
 
 Net effect: once **any** modern member posts in a group, the iOS 6 device learns that
-group's gid and every subsequent send threads correctly — and because a group's gid is
+group's gid and every subsequent send threads correctly, and because a group's gid is
 **stable across renames**, learning it once fixes the group permanently.
 
 It is purely additive: only outgoing **group** sends (2+ participants) are touched;
-1‑to‑1 messages and all incoming messages are untouched. Removing the tweak (or deleting
-the learned map) returns the device to 100 % stock behaviour.
-
-## Status
-
-✅ **Working and verified on real hardware** (iPhone 5, iOS 6.1.4) against a modern
-iPhone (iOS 15.4). Clean A/B by message ROWID in the modern device's `sms.db`:
-
-| send | gid injected? | landed in |
-|------|---------------|-----------|
-| iOS 6, before learning | no  | the **fork** |
-| iOS 6, after learning  | yes (auto) | the **named group**, alongside the modern members |
-
-Confirmed to hold through a live group rename.
+1‑to‑1 messages and all incoming messages are untouched.
 
 ## Install
 
@@ -73,7 +60,7 @@ Confirmed to hold through a live group rename.
   [Releases](https://github.com/mikey820/GroupChatNameFix/releases) and
   `dpkg -i` it, then respring (or `killall imagent`).
 
-Requirements: jailbroken **iOS 6** (rootful), `mobilesubstrate`. The tweak injects into
+Requirements: jailbroken **iOS 6**, `mobilesubstrate`. The tweak injects into
 `imagent`.
 
 ## Files
@@ -111,11 +98,11 @@ fully automatic operation.
 
 ## How it was found
 
-The relevant code is **not** in `IMDaemonCore` (a thin shim) — it lives in the
+The relevant code is **not** in `IMDaemonCore` (a thin shim), it lives in the
 `iMessage.imservice` plugin and `IMFoundation`, which on iOS 6 exist only inside the
 `dyld_shared_cache`. The send/receive paths and the `gid` injection seam were located by
 pulling the cache off the device and analysing it with a small custom dyld‑cache reader +
-Thumb‑2 disassembler. Key detail for anyone reproducing: this cache stores embedded
+Thumb‑2 disassembler. This cache stores embedded
 DATA/literal‑pool pointers with a constant slide of `0x30A8000` (subtract before mapping;
 code/section/symbol addresses are **not** slid).
 
