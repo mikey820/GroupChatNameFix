@@ -38,6 +38,8 @@
 #import <objc/message.h>
 #import <objc/runtime.h>
 #import <mach/mach.h>
+#import <mach-o/dyld.h>
+#import <dispatch/dispatch.h>
 
 extern void MSHookMessageEx(Class cls, SEL sel, IMP imp, IMP *result);
 
@@ -85,6 +87,7 @@ static int GCUIntCmp(const void *a, const void *b) {
 static void GCBuildClassList(void) {
     int n = objc_getClassList(NULL, 0);
     if (n <= 0) return;
+    if (gClassPtrs) { free(gClassPtrs); gClassPtrs = NULL; gClassCount = 0; }
     Class *tmp = (Class *)malloc(sizeof(Class) * n);
     if (!tmp) return;
     gClassCount = objc_getClassList(tmp, n);
@@ -198,22 +201,41 @@ static void gc_mdc_send(id self, SEL _cmd,
 }
 
 // ===========================================================================
-static void GCHook(const char *clsName, const char *selName, IMP repl, void **slot) {
-    Class c = objc_getClass(clsName);
-    if (!c) { GCLog(@"NOCLASS %s", clsName); return; }
-    SEL sel = sel_getUid(selName);
-    if (!class_getInstanceMethod(c, sel)) { GCLog(@"NOSEL -[%s %s]", clsName, selName); return; }
-    MSHookMessageEx(c, sel, repl, (IMP *)slot);
-    GCLog(@"HOOKED -[%s %s]", clsName, selName);
+static const char *kMDCSel =
+    "_sendMessage:messageString:messageDictionary:fromID:fromIdentity:toID:"
+    "toToken:toSessionToken:toPeople:ackBlock:completionBlock:";
+
+// iMessage.imservice (which defines MessageDeliveryController) loads lazily into
+// imagent on first iMessage activity, so the class is absent at %ctor. Bind when
+// it appears: try now, and on every dyld image-load until bound.
+static volatile int gBound = 0;
+static void GCTryBind(void) {
+    if (gBound) return;
+    Class c = objc_getClass("MessageDeliveryController");
+    if (!c) return;
+    SEL sel = sel_getUid(kMDCSel);
+    if (!class_getInstanceMethod(c, sel)) return;
+    gBound = 1;
+    GCBuildClassList();   // rebuild so membership includes the just-loaded plugin classes
+    MSHookMessageEx(c, sel, (IMP)gc_mdc_send, (IMP *)&orig_mdc_send);
+    GCLog(@"HOOKED -[MessageDeliveryController _sendMessage:...messageDictionary:...] (classes=%d)", gClassCount);
+}
+static void GCImageAdded(const struct mach_header *mh, intptr_t slide) {
+    if (gBound) return;
+    GCTryBind();
+    if (!gBound)   // objc may register the image's classes just after this callback
+        dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(0.25 * NSEC_PER_SEC)),
+                       dispatch_get_global_queue(0, 0), ^{ GCTryBind(); });
 }
 
 %ctor {
     @autoreleasepool {
         GCBuildClassList();
         GCLog(@"=== GroupChatNameFix 6.0.0 (gid/gv inject) loaded, classes=%d ===", gClassCount);
-        GCHook("MessageDeliveryController",
-               "_sendMessage:messageString:messageDictionary:fromID:fromIdentity:toID:"
-               "toToken:toSessionToken:toPeople:ackBlock:completionBlock:",
-               (IMP)gc_mdc_send, (void **)&orig_mdc_send);
+        GCTryBind();
+        if (!gBound) {
+            _dyld_register_func_for_add_image(GCImageAdded);
+            GCLog(@"MessageDeliveryController not yet loaded; armed dyld image-load watcher");
+        }
     }
 }
