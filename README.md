@@ -1,8 +1,9 @@
 # GroupChatNameFix
 
-A MobileSubstrate tweak for **iOS 6** (armv7/armv7s, jailbroken) that fixes group
+A MobileSubstrate tweak for **iOS 6** (armv7/armv7s, jailbroken) that (1) fixes group
 iMessages from the iOS 6 device showing up as a **separate / duplicated conversation**
-for everyone else once a modern‑iOS member gives the group a name.
+for everyone else once a modern‑iOS member gives the group a name, and (2) **shows that
+group name** in the iOS 6 Messages app instead of the bare participant list.
 
 > TL;DR — after someone on modern iOS names (or renames) a group that includes an
 > iOS 6 device, every message the iOS 6 device sends lands in a brand‑new thread for
@@ -53,6 +54,24 @@ group's gid and every subsequent send threads correctly, and because a group's g
 It is purely additive: only outgoing **group** sends (2+ participants) are touched;
 1‑to‑1 messages and all incoming messages are untouched.
 
+## Showing the group name (v7.0.0)
+
+iOS 6's `ChatKit` has no concept of a *named* group, so the Messages app titles a group
+transcript with the participant list. But the name actually arrives — it rides in the same
+end‑to‑end payload as the `gid`. So the tweak now also:
+
+1. **Harvests the name.** The same `JWDecodeDictionary` hook that learns the `gid` also
+   pulls the group name out of decoded inbound payloads and persists a
+   `participants → name` map to `/var/mobile/gcnf_names.plist`.
+2. **Displays it.** A second injection into **`MobileSMS`** hooks
+   `-[CKTranscriptController setConversation:]` (re‑asserted from
+   `-[CKMessagesController _showTranscriptController:animated:]`) and, when the on‑screen
+   conversation's participant set matches a learned name, sets the navigation title to it.
+
+The routing and display halves are joined by a scheme/format‑insensitive participant key,
+so the `mailto:`/`tel:` URIs `imagent` sees line up with the raw addresses `ChatKit`
+exposes. Display is cosmetic and entirely on the iOS 6 device — no protocol effect.
+
 ## Install
 
 https://mikey820.github.io/repo/
@@ -63,15 +82,17 @@ https://mikey820.github.io/repo/
   `dpkg -i` it, then respring (or `killall imagent`).
 
 Requirements: jailbroken **iOS 6**, `mobilesubstrate`. The tweak injects into
-`imagent`.
+`imagent` (routing) and `MobileSMS` (name display).
 
 ## Files
 
 | path | purpose |
 |------|---------|
-| `/Library/MobileSubstrate/DynamicLibraries/GroupChatNameFix.dylib` | the tweak |
+| `/Library/MobileSubstrate/DynamicLibraries/GroupChatNameFix.dylib` | the tweak (loads into `imagent` + `MobileSMS`) |
 | `/var/mobile/gcnf_learned.plist` | auto‑learned `participants → gid` map (persisted) |
-| `/var/mobile/gcnf_gid.txt` | **optional** manual override (see below) |
+| `/var/mobile/gcnf_names.plist` | auto‑learned `participants → name` map (persisted) |
+| `/var/mobile/gcnf_gid.txt` | **optional** manual gid override (see below) |
+| `/var/mobile/gcnf_forcename.txt` | **optional** UI test: force this string as every group's title |
 | `/var/mobile/GroupChatNameFix.log` | diagnostic log |
 
 ### Manual override (optional)

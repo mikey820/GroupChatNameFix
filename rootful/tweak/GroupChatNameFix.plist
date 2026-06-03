@@ -1,1 +1,1 @@
-{ Filter = { Executables = ( "imagent" ); }; }
+{ Filter = { Executables = ( "imagent", "MobileSMS" ); }; }

@@ -1,31 +1,27 @@
-// GroupChatNameFix - iOS 6 (armv7s) tweak for imagent / iMessage.imservice
+// GroupChatNameFix - iOS 6 (armv7s) tweak for imagent / iMessage.imservice + MobileSMS.
 //
-// v6.1.0 - SELF-CONTAINED autonomous fix (no companion device, no manual config).
+// v7.0.0 - now ALSO shows the modern group's NAME in the iOS 6 Messages UI.
 // -----------------------------------------------------------------------------
-// v6.0.0 PROVED (real-hw dev35 sms.db ROWID A/B) that injecting gid+gv=8 into the
-// outgoing Madrid payload threads iOS6's group messages into the modern named
-// group instead of forking them. The send seam is:
-//   -[MessageDeliveryController _sendMessage:messageString:messageDictionary:..]
-//   -> _JWEncodeDictionary(messageDictionary) -> gzip -> encrypt -> APS
-// iOS6's payload is {p=(participants); t=text; v=1} with NO gid.
+// Two cooperating halves, one dylib (filtered into both imagent and MobileSMS):
 //
-// The only open question was WHERE iOS6 gets the group's gid (it's not in the
-// FZMessage, and the rename c=190 is encrypted/ignored). ANSWER (from RE of the
-// incoming path): every inbound message is decoded by the EXPORTED C function
-//   id JWDecodeDictionary(NSData *plaintext)   // IMFoundation
-// called from -[MessageServiceSession _handler:incomingMessage:...]. Decryption
-// is end-to-end, so iOS6 receives EXACTLY what the modern sender encrypted -
-// including gid/gv (the stripping only happens later, at FZMessage). So:
+//  imagent  (routing, unchanged from v6.1.0, PLUS name harvest):
+//    - HARVEST gid: hook exported C JWDecodeDictionary; learn participants->gid.
+//    - HARVEST name: same hook - when a decoded inbound dict carries the group
+//      name, learn matchkey->name into /var/mobile/gcnf_names.plist.
+//    - INJECT gid+gv=8 on send via -[MessageDeliveryController _sendMessage:...].
 //
-//   HARVEST: MSHookFunction JWDecodeDictionary; when an inbound dict has gid+p,
-//            learn participants->gid and persist to /var/mobile/gcnf_learned.plist
-//   INJECT : on send, look up the learned gid by the outgoing participant set and
-//            add gid+gv=8 to a mutable copy of messageDictionary before encode.
+//  MobileSMS (display, NEW):
+//    - hook -[CKTranscriptController setConversation:] (+ viewWillAppear:) and,
+//      when the on-screen conversation's participant set matches a learned name,
+//      set the navigation title to that name. iOS 6 ChatKit has no concept of a
+//      named group, so it otherwise shows the participant list.
 //
-// Net: once ANY modern member posts to the group, iOS6 self-heals and all its
-// subsequent sends thread correctly - entirely on the iOS6 device.
-// /var/mobile/gcnf_gid.txt (gid=..., gv=..., minpeople=...) still works as a
-// manual override/test forcing a fixed gid for every group send.
+// The two halves are joined by a normalized participant "matchkey" (scheme- and
+// formatting-insensitive) so the URIs imagent sees ("mailto:x", "tel:+1...") line
+// up with the raw addresses ChatKit exposes ("x", "+1...").
+//
+// Testing the UI half in isolation: drop /var/mobile/gcnf_forcename.txt containing
+// a single line of text; every 2+ person conversation will show that as its title.
 // -----------------------------------------------------------------------------
 // Crash-proofing (v5.x): hook args typed void*, validated via vm_read_overwrite
 // + registered-class check before any objc_msgSend (ARC never sees raw non-objs).
@@ -38,14 +34,17 @@
 #import <dispatch/dispatch.h>
 #import <dlfcn.h>
 #import <pthread.h>
+#import <stdlib.h>
 
 extern void MSHookMessageEx(Class cls, SEL sel, IMP imp, IMP *result);
 extern void MSHookFunction(void *symbol, void *replacement, void **result);
 extern void *MSFindSymbol(void *image, const char *name);
 
 static NSString *const kLogPath     = @"/var/mobile/GroupChatNameFix.log";
-static NSString *const kGidPath     = @"/var/mobile/gcnf_gid.txt";        // manual override
-static NSString *const kLearnedPath = @"/var/mobile/gcnf_learned.plist";  // auto-learned map
+static NSString *const kGidPath     = @"/var/mobile/gcnf_gid.txt";          // manual gid override
+static NSString *const kLearnedPath = @"/var/mobile/gcnf_learned.plist";    // auto-learned participants->gid
+static NSString *const kNamesPath   = @"/var/mobile/gcnf_names.plist";      // auto-learned matchkey->name
+static NSString *const kForceName   = @"/var/mobile/gcnf_forcename.txt";    // UI test override
 static int gLogBudget = 4000;
 
 static void GCLog(NSString *fmt, ...) {
@@ -112,10 +111,14 @@ static BOOL GCIsObjectPtr(const void *p) {
 }
 
 // ===========================================================================
-// Learned participants->gid map (persisted), + manual override file.
+// Normalized keys.
+//   GCPKey   - URI-exact key for the participants->gid map (unchanged).
+//   GCMatchKey/GCNormAddr - scheme/format-insensitive key shared by imagent's
+//              harvest and MobileSMS's display so the two processes agree.
 // ===========================================================================
 static pthread_mutex_t gLock = PTHREAD_MUTEX_INITIALIZER;
 static NSMutableDictionary *gLearned = nil;   // key=participant-set -> gid
+static NSMutableDictionary *gNames = nil;     // key=matchkey -> group name
 
 static void GCLoadLearned(void) {
     if (gLearned) return;
@@ -131,6 +134,40 @@ static NSString *GCPKey(id parr) {
         NSMutableArray *m = [NSMutableArray array];
         for (id e in (NSArray *)parr)
             if ([e isKindOfClass:[NSString class]]) [m addObject:[(NSString *)e lowercaseString]];
+        if (m.count == 0) return nil;
+        [m sortUsingSelector:@selector(compare:)];
+        return [m componentsJoinedByString:@"|"];
+    } @catch (__unused id e) { return nil; }
+}
+
+// One address -> canonical token. Strips a scheme ("mailto:"/"tel:"/...) and,
+// for phone numbers, keeps the last 10 digits; emails keep local@domain lower.
+static NSString *GCNormAddr(NSString *s) {
+    if (![s isKindOfClass:[NSString class]] || s.length == 0) return nil;
+    NSString *a = [s lowercaseString];
+    NSRange colon = [a rangeOfString:@":"];
+    if (colon.location != NSNotFound && colon.location < 8)   // strip scheme
+        a = [a substringFromIndex:colon.location + 1];
+    a = [a stringByTrimmingCharactersInSet:[NSCharacterSet whitespaceCharacterSet]];
+    if ([a rangeOfString:@"@"].location != NSNotFound) return a;  // email: as-is
+    NSMutableString *digits = [NSMutableString string];           // phone: digits only
+    for (NSUInteger i = 0; i < a.length; i++) {
+        unichar c = [a characterAtIndex:i];
+        if (c >= '0' && c <= '9') [digits appendFormat:@"%C", c];
+    }
+    if (digits.length >= 10) return [digits substringFromIndex:digits.length - 10];
+    return digits.length ? digits : a;
+}
+
+// Build a match key from an array of address strings (URIs or raw).
+static NSString *GCMatchKey(id addrs) {
+    if (!addrs || ![addrs respondsToSelector:@selector(count)]) return nil;
+    @try {
+        NSMutableArray *m = [NSMutableArray array];
+        for (id e in (NSArray *)addrs) {
+            NSString *t = GCNormAddr([e isKindOfClass:[NSString class]] ? e : [e description]);
+            if (t.length) [m addObject:t];
+        }
         if (m.count == 0) return nil;
         [m sortUsingSelector:@selector(compare:)];
         return [m componentsJoinedByString:@"|"];
@@ -160,7 +197,37 @@ static void GCStoreGid(NSString *key, NSString *gid) {
     if (changed) GCLOGB(@"LEARNED gid=%@ for participants=%@", gid, key);
 }
 
-// Manual override: /var/mobile/gcnf_gid.txt with gid=... [gv=...] [minpeople=...]
+// matchkey -> name map (written by imagent harvest, read by MobileSMS display).
+static void GCLoadNames(void) {
+    NSDictionary *d = [NSDictionary dictionaryWithContentsOfFile:kNamesPath];
+    if (d) gNames = [d mutableCopy];
+    else if (!gNames) gNames = [NSMutableDictionary dictionary];
+}
+
+static void GCStoreName(NSString *key, NSString *name) {
+    if (key.length == 0 || name.length == 0) return;
+    pthread_mutex_lock(&gLock);
+    GCLoadNames();
+    BOOL changed = ![gNames[key] isEqualToString:name];
+    if (changed) {
+        gNames[key] = name;
+        @try { [gNames writeToFile:kNamesPath atomically:YES]; } @catch (__unused id e) {}
+    }
+    pthread_mutex_unlock(&gLock);
+    if (changed) GCLOGB(@"LEARNED name=%@ for matchkey=%@", name, key);
+}
+
+static NSString *GCLookupName(NSString *key) {
+    if (!key) return nil;
+    NSString *r = nil;
+    pthread_mutex_lock(&gLock);
+    GCLoadNames();           // re-read each lookup: imagent may have just updated it
+    r = gNames[key];
+    pthread_mutex_unlock(&gLock);
+    return r;
+}
+
+// Manual gid override: /var/mobile/gcnf_gid.txt with gid=... [gv=...] [minpeople=...]
 static NSDictionary *GCManualOverride(void) {
     NSError *e = nil;
     NSString *cfg = [NSString stringWithContentsOfFile:kGidPath encoding:NSUTF8StringEncoding error:&e];
@@ -179,8 +246,28 @@ static NSDictionary *GCManualOverride(void) {
 
 // ===========================================================================
 // HARVEST: id JWDecodeDictionary(NSData *plaintext) -- every inbound payload.
+// Learns participants->gid AND matchkey->name. Candidate name keys are probed
+// and logged so the real one is confirmed against live traffic.
 // ===========================================================================
 static void *(*orig_JWDecode)(void *);
+static NSString *GCExtractName(id d) {
+    // direct keys seen across Madrid group payloads
+    for (NSString *k in @[@"n", @"gn", @"nr", @"name"]) {
+        id v = [d objectForKey:k];
+        if ([v isKindOfClass:[NSString class]] && [(NSString *)v length]) return v;
+    }
+    // some clients nest a group action under "tg"/"gc"
+    for (NSString *k in @[@"tg", @"gc"]) {
+        id sub = [d objectForKey:k];
+        if ([sub isKindOfClass:[NSDictionary class]]) {
+            for (NSString *kk in @[@"n", @"gn", @"name", @"nr"]) {
+                id v = [sub objectForKey:kk];
+                if ([v isKindOfClass:[NSString class]] && [(NSString *)v length]) return v;
+            }
+        }
+    }
+    return nil;
+}
 static void *gc_JWDecode(void *data) {
     void *r = orig_JWDecode(data);
     @try {
@@ -192,6 +279,13 @@ static void *gc_JWDecode(void *data) {
                 if ([gid isKindOfClass:[NSString class]] && p) {
                     NSString *key = GCPKey(p);
                     if (key) GCStoreGid(key, (NSString *)gid);
+                    // probe: show the shape of gid-bearing payloads while we learn names
+                    GCLOGB(@"DECODE gid-dict keys=%@", [[d allKeys] componentsJoinedByString:@","]);
+                    NSString *nm = GCExtractName(d);
+                    if (nm) {
+                        NSString *mk = GCMatchKey(p);
+                        if (mk) GCStoreName(mk, nm);
+                    }
                 }
             }
         }
@@ -246,12 +340,131 @@ static void gc_mdc_send(id self, SEL _cmd,
 }
 
 // ===========================================================================
-static volatile int gBoundSend = 0, gBoundDecode = 0;
+// DISPLAY (MobileSMS): override the transcript title for a known named group.
+// ===========================================================================
+// Safe objc_msgSend helper returning id.
+static id GCSend0(id obj, SEL s) {
+    if (!GCIsObjectPtr((__bridge const void *)obj) || ![obj respondsToSelector:s]) return nil;
+    return ((id(*)(id, SEL))objc_msgSend)(obj, s);
+}
+
+// Pull the recipient address strings out of a CKConversation.
+static NSArray *GCConversationAddresses(id conv) {
+    if (!GCIsObjectPtr((__bridge const void *)conv)) return nil;
+    NSArray *ents = nil;
+    @try {
+        if ([conv respondsToSelector:@selector(__copyEntities)])
+            ents = (__bridge_transfer NSArray *)(void *)
+                   ((void *(*)(id, SEL))objc_msgSend)(conv, @selector(__copyEntities));
+    } @catch (__unused id e) { ents = nil; }
+    if (![ents respondsToSelector:@selector(count)]) return nil;
+    NSMutableArray *addrs = [NSMutableArray array];
+    @try {
+        for (id ent in ents) {
+            id a = GCSend0(ent, @selector(rawAddress));
+            if (![a isKindOfClass:[NSString class]]) a = GCSend0(ent, @selector(name));
+            if ([a isKindOfClass:[NSString class]]) [addrs addObject:a];
+        }
+    } @catch (__unused id e) {}
+    return addrs.count ? addrs : nil;
+}
+
+static NSString *GCForceName(void) {
+    NSError *e = nil;
+    NSString *s = [NSString stringWithContentsOfFile:kForceName encoding:NSUTF8StringEncoding error:&e];
+    s = [s stringByTrimmingCharactersInSet:[NSCharacterSet whitespaceAndNewlineCharacterSet]];
+    return s.length ? s : nil;
+}
+
+// Resolve the display name to use for a transcript controller's conversation.
+static NSString *GCTitleForConversation(id conv) {
+    NSArray *addrs = GCConversationAddresses(conv);
+    if (addrs.count < 2) {                       // 1:1 chats are left untouched
+        if (addrs.count) GCLOGB(@"UI conv addrs=%@ (not a group, skip)",
+                                [addrs componentsJoinedByString:@","]);
+        return nil;
+    }
+    NSString *forced = GCForceName();
+    if (forced) { GCLOGB(@"UI force-name -> %@", forced); return forced; }
+    NSString *mk = GCMatchKey(addrs);
+    NSString *nm = GCLookupName(mk);
+    GCLOGB(@"UI conv matchkey=%@ name=%@", mk, nm ?: @"(none)");
+    return nm;
+}
+
+static void GCApplyTitle(id transcriptVC, NSString *name) {
+    if (!name.length || !GCIsObjectPtr((__bridge const void *)transcriptVC)) return;
+    @try {
+        if ([transcriptVC respondsToSelector:@selector(setTitle:)])
+            ((void(*)(id, SEL, id))objc_msgSend)(transcriptVC, @selector(setTitle:), name);
+        id navItem = GCSend0(transcriptVC, @selector(navigationItem));
+        if (navItem && [navItem respondsToSelector:@selector(setTitle:)])
+            ((void(*)(id, SEL, id))objc_msgSend)(navItem, @selector(setTitle:), name);
+        GCLOGB(@"UI applied title=%@", name);
+    } @catch (__unused id e) {}
+}
+
+// Hook -[CKTranscriptController setConversation:]
+static void (*orig_tc_setConv)(id, SEL, void *);
+static void gc_tc_setConv(id self, SEL _cmd, void *conv) {
+    orig_tc_setConv(self, _cmd, conv);
+    @try {
+        id c = GCIsObjectPtr(conv) ? (__bridge id)conv : nil;
+        NSString *nm = GCTitleForConversation(c);
+        if (nm) {
+            // hold onto it so viewWillAppear: can re-assert after the OS recomputes
+            objc_setAssociatedObject(self, (void *)&orig_tc_setConv, nm, OBJC_ASSOCIATION_RETAIN_NONATOMIC);
+            GCApplyTitle(self, nm);
+        }
+    } @catch (__unused id e) {}
+}
+
+// Hook -[CKTranscriptController viewWillAppear:] to re-assert (title is often
+// recomputed from recipients right before the view shows). Only bound if the
+// class DIRECTLY implements it (see GCDirectlyImplements) so we never end up
+// retargeting UIViewController's shared implementation.
+static void (*orig_tc_vwa)(id, SEL, BOOL);
+static void gc_tc_vwa(id self, SEL _cmd, BOOL animated) {
+    orig_tc_vwa(self, _cmd, animated);
+    @try {
+        NSString *nm = objc_getAssociatedObject(self, (void *)&orig_tc_setConv);
+        if (![nm isKindOfClass:[NSString class]] || !nm.length) {
+            id conv = GCSend0(self, @selector(conversation));
+            nm = GCTitleForConversation(conv);
+        }
+        if (nm.length) GCApplyTitle(self, nm);
+    } @catch (__unused id e) {}
+}
+
+// Hook -[CKMessagesController _showTranscriptController:animated:] - the moment
+// the transcript is actually presented, which is the safest re-assert point.
+static void (*orig_mc_showTC)(id, SEL, void *, BOOL);
+static void gc_mc_showTC(id self, SEL _cmd, void *tc, BOOL animated) {
+    orig_mc_showTC(self, _cmd, tc, animated);
+    @try {
+        id vc = GCIsObjectPtr(tc) ? (__bridge id)tc : nil;
+        if (vc) {
+            id conv = GCSend0(vc, @selector(conversation));
+            NSString *nm = GCTitleForConversation(conv);
+            if (nm.length) GCApplyTitle(vc, nm);
+        }
+    } @catch (__unused id e) {}
+}
+
+// ===========================================================================
+static volatile int gBoundSend = 0, gBoundDecode = 0, gBoundUI = 0;
 static const char *kMDCSel =
     "_sendMessage:messageString:messageDictionary:fromID:fromIdentity:toID:"
     "toToken:toSessionToken:toPeople:ackBlock:completionBlock:";
 
-static void GCTryBind(void) {
+static BOOL GCInMobileSMS(void) {
+    NSString *bid = [[NSBundle mainBundle] bundleIdentifier];
+    if ([bid isEqualToString:@"com.apple.MobileSMS"]) return YES;
+    const char *prog = getprogname();
+    return prog && strcmp(prog, "MobileSMS") == 0;
+}
+
+static void GCBindIMAgent(void) {
     if (!gBoundSend) {
         Class c = objc_getClass("MessageDeliveryController");
         SEL sel = sel_getUid(kMDCSel);
@@ -272,22 +485,71 @@ static void GCTryBind(void) {
         }
     }
 }
+
+// True only if `c` itself defines `s` (not merely inherits it) - so we never
+// retarget a superclass IMP shared by every subclass.
+static BOOL GCDirectlyImplements(Class c, SEL s) {
+    if (!c) return NO;
+    unsigned int n = 0;
+    Method *ms = class_copyMethodList(c, &n);
+    BOOL found = NO;
+    for (unsigned int i = 0; i < n; i++)
+        if (method_getName(ms[i]) == s) { found = YES; break; }
+    if (ms) free(ms);
+    return found;
+}
+
+static void GCBindUI(void) {
+    if (gBoundUI) return;
+    Class tc = objc_getClass("CKTranscriptController");
+    SEL setConv = sel_getUid("setConversation:");
+    if (!tc || !GCDirectlyImplements(tc, setConv)) return;  // ChatKit not up yet
+
+    gBoundUI = 1;
+    GCBuildClassList();
+    MSHookMessageEx(tc, setConv, (IMP)gc_tc_setConv, (IMP *)&orig_tc_setConv);
+    GCLog(@"HOOKED display -[CKTranscriptController setConversation:]");
+
+    SEL vwa = sel_getUid("viewWillAppear:");
+    if (GCDirectlyImplements(tc, vwa)) {
+        MSHookMessageEx(tc, vwa, (IMP)gc_tc_vwa, (IMP *)&orig_tc_vwa);
+        GCLog(@"HOOKED display -[CKTranscriptController viewWillAppear:]");
+    }
+
+    Class mc = objc_getClass("CKMessagesController");
+    SEL showTC = sel_getUid("_showTranscriptController:animated:");
+    if (GCDirectlyImplements(mc, showTC)) {
+        MSHookMessageEx(mc, showTC, (IMP)gc_mc_showTC, (IMP *)&orig_mc_showTC);
+        GCLog(@"HOOKED display -[CKMessagesController _showTranscriptController:animated:]");
+    }
+}
+
+static BOOL gIsUI = NO;
+static void GCTryBind(void) {
+    if (gIsUI) GCBindUI();
+    else       GCBindIMAgent();
+}
+static BOOL GCAllBound(void) {
+    return gIsUI ? (gBoundUI != 0) : (gBoundSend && gBoundDecode);
+}
 static void GCImageAdded(const struct mach_header *mh, intptr_t slide) {
-    if (gBoundSend && gBoundDecode) return;
+    if (GCAllBound()) return;
     GCTryBind();
-    if (!(gBoundSend && gBoundDecode))
+    if (!GCAllBound())
         dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(0.25 * NSEC_PER_SEC)),
                        dispatch_get_global_queue(0, 0), ^{ GCTryBind(); });
 }
 
 %ctor {
     @autoreleasepool {
+        gIsUI = GCInMobileSMS();
         GCBuildClassList();
-        GCLog(@"=== GroupChatNameFix 6.1.0 (autonomous harvest+inject) loaded, classes=%d ===", gClassCount);
+        GCLog(@"=== GroupChatNameFix 7.0.0 loaded in %s (classes=%d) ===",
+              gIsUI ? "MobileSMS[display]" : "imagent[routing]", gClassCount);
         GCTryBind();
-        if (!(gBoundSend && gBoundDecode)) {
+        if (!GCAllBound()) {
             _dyld_register_func_for_add_image(GCImageAdded);
-            GCLog(@"armed dyld watcher (send=%d decode=%d)", gBoundSend, gBoundDecode);
+            GCLog(@"armed dyld watcher (ui=%d send=%d decode=%d)", gBoundUI, gBoundSend, gBoundDecode);
         }
     }
 }
