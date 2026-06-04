@@ -63,14 +63,17 @@ end‑to‑end payload as the `gid`. So the tweak now also:
 1. **Harvests the name.** The same `JWDecodeDictionary` hook that learns the `gid` also
    pulls the group name out of decoded inbound payloads and persists a
    `participants → name` map to `/var/mobile/gcnf_names.plist`.
-2. **Displays it.** A second injection into **`MobileSMS`** hooks
-   `-[CKTranscriptController setConversation:]` (re‑asserted from
-   `-[CKMessagesController _showTranscriptController:animated:]`) and, when the on‑screen
-   conversation's participant set matches a learned name, sets the navigation title to it.
+2. **Displays it.** A second injection into **`MobileSMS`** sets the learned name both on
+   the open conversation (hooks `-[CKTranscriptController setConversation:]`, re‑asserted
+   from `-[CKMessagesController _showTranscriptController:animated:]`) and on each row of
+   the main Messages list (hooks `-[CKConversationListController
+   tableView:cellForRowAtIndexPath:]`).
 
-The routing and display halves are joined by a scheme/format‑insensitive participant key,
-so the `mailto:`/`tel:` URIs `imagent` sees line up with the raw addresses `ChatKit`
-exposes. Display is cosmetic and entirely on the iOS 6 device — no protocol effect.
+The routing and display halves are joined by a scheme/format‑insensitive participant key.
+Because `imagent`'s participant list includes the device's **own** handle but `ChatKit`'s
+recipient list does not, the harvest side strips the device's own iMessage handles (looked
+up from `IMCore`) before building the key, so both sides agree on an exact match. Display
+is cosmetic and entirely on the iOS 6 device — no protocol effect.
 
 ## Install
 

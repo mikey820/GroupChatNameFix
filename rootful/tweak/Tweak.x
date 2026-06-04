@@ -110,6 +110,12 @@ static BOOL GCIsObjectPtr(const void *p) {
     return GCIsRegisteredClass(c);
 }
 
+// Safe objc_msgSend helper returning id (validates the receiver first).
+static id GCSend0(id obj, SEL s) {
+    if (!GCIsObjectPtr((__bridge const void *)obj) || ![obj respondsToSelector:s]) return nil;
+    return ((id(*)(id, SEL))objc_msgSend)(obj, s);
+}
+
 // ===========================================================================
 // Normalized keys.
 //   GCPKey   - URI-exact key for the participants->gid map (unchanged).
@@ -159,14 +165,49 @@ static NSString *GCNormAddr(NSString *s) {
     return digits.length ? digits : a;
 }
 
+// The device's own iMessage handles (normalized), so we can drop "self" from a
+// participant list. imagent's "p" includes self; ChatKit's recipient list does
+// not - stripping self makes the two sides produce the SAME key (exact match,
+// no fuzzy subset guessing). Fetched lazily from IMCore; never cached empty.
+static NSSet *gSelfSet = nil;
+static NSSet *GCSelfHandles(void) {
+    if (gSelfSet) return gSelfSet;
+    NSMutableSet *s = [NSMutableSet set];
+    @try {
+        Class cc = objc_getClass("IMAccountController");
+        if (cc && [cc respondsToSelector:@selector(sharedInstance)]) {
+            id ctrl = ((id(*)(id, SEL))objc_msgSend)((id)cc, @selector(sharedInstance));
+            id accts = GCSend0(ctrl, @selector(connectedAccounts));
+            if (![accts respondsToSelector:@selector(count)]) accts = GCSend0(ctrl, @selector(accounts));
+            if ([accts respondsToSelector:@selector(count)]) {
+                for (id acct in (NSArray *)accts) {
+                    id handles = GCSend0(acct, @selector(arrayOfAllIMHandles));
+                    if ([handles respondsToSelector:@selector(count)]) {
+                        for (id h in (NSArray *)handles) {
+                            id idstr = GCSend0(h, @selector(ID));
+                            if (![idstr isKindOfClass:[NSString class]]) idstr = GCSend0(h, @selector(normalizedID));
+                            NSString *n = GCNormAddr([idstr isKindOfClass:[NSString class]] ? idstr : nil);
+                            if (n.length) [s addObject:n];
+                        }
+                    }
+                }
+            }
+        }
+    } @catch (__unused id e) {}
+    if (s.count) { gSelfSet = [s copy]; GCLOGB(@"SELF handles=%@", [[gSelfSet allObjects] componentsJoinedByString:@","]); }
+    return s.count ? gSelfSet : s;
+}
+
 // Build a match key from an array of address strings (URIs or raw).
-static NSString *GCMatchKey(id addrs) {
+// When dropSelf is YES, the device's own handles are removed first.
+static NSString *GCMatchKeyEx(id addrs, BOOL dropSelf) {
     if (!addrs || ![addrs respondsToSelector:@selector(count)]) return nil;
     @try {
+        NSSet *selfSet = dropSelf ? GCSelfHandles() : nil;
         NSMutableArray *m = [NSMutableArray array];
         for (id e in (NSArray *)addrs) {
             NSString *t = GCNormAddr([e isKindOfClass:[NSString class]] ? e : [e description]);
-            if (t.length) [m addObject:t];
+            if (t.length && !(selfSet && [selfSet containsObject:t])) [m addObject:t];
         }
         if (m.count == 0) return nil;
         [m sortUsingSelector:@selector(compare:)];
@@ -227,29 +268,6 @@ static NSString *GCLookupName(NSString *key) {
     return r;
 }
 
-// imagent's participant set ("p") includes the device's OWN handle; ChatKit's
-// recipient list does not. So an exact key match usually fails by exactly the
-// self handle(s). Fall back to the stored key whose number-set is the tightest
-// superset of the on-screen set (the extra members being self).
-static NSString *GCLookupNameSubset(NSString *uiKey) {
-    if (uiKey.length == 0) return nil;
-    NSString *exact = GCLookupName(uiKey);
-    if (exact) return exact;
-    NSSet *uiSet = [NSSet setWithArray:[uiKey componentsSeparatedByString:@"|"]];
-    NSString *best = nil; NSUInteger bestExtra = NSUIntegerMax;
-    pthread_mutex_lock(&gLock);
-    GCLoadNames();
-    for (NSString *sk in gNames) {
-        NSSet *ss = [NSSet setWithArray:[sk componentsSeparatedByString:@"|"]];
-        if (ss.count > uiSet.count && [uiSet isSubsetOfSet:ss]) {
-            NSUInteger extra = ss.count - uiSet.count;
-            if (extra < bestExtra) { bestExtra = extra; best = gNames[sk]; }
-        }
-    }
-    pthread_mutex_unlock(&gLock);
-    return best;
-}
-
 // Manual gid override: /var/mobile/gcnf_gid.txt with gid=... [gv=...] [minpeople=...]
 static NSDictionary *GCManualOverride(void) {
     NSError *e = nil;
@@ -306,7 +324,7 @@ static void *gc_JWDecode(void *data) {
                     GCLOGB(@"DECODE gid-dict keys=%@", [[d allKeys] componentsJoinedByString:@","]);
                     NSString *nm = GCExtractName(d);
                     if (nm) {
-                        NSString *mk = GCMatchKey(p);
+                        NSString *mk = GCMatchKeyEx(p, YES);   // drop self so the key matches the UI side
                         if (mk) GCStoreName(mk, nm);
                     }
                 }
@@ -365,12 +383,6 @@ static void gc_mdc_send(id self, SEL _cmd,
 // ===========================================================================
 // DISPLAY (MobileSMS): override the transcript title for a known named group.
 // ===========================================================================
-// Safe objc_msgSend helper returning id.
-static id GCSend0(id obj, SEL s) {
-    if (!GCIsObjectPtr((__bridge const void *)obj) || ![obj respondsToSelector:s]) return nil;
-    return ((id(*)(id, SEL))objc_msgSend)(obj, s);
-}
-
 // Pull the recipient address strings out of a CKConversation.
 static NSArray *GCConversationAddresses(id conv) {
     if (!GCIsObjectPtr((__bridge const void *)conv)) return nil;
@@ -409,8 +421,8 @@ static NSString *GCTitleForConversation(id conv) {
     }
     NSString *forced = GCForceName();
     if (forced) { GCLOGB(@"UI force-name -> %@", forced); return forced; }
-    NSString *mk = GCMatchKey(addrs);
-    NSString *nm = GCLookupNameSubset(mk);
+    NSString *mk = GCMatchKeyEx(addrs, YES);   // drop self too, in case ChatKit ever includes it
+    NSString *nm = GCLookupName(mk);
     GCLOGB(@"UI conv matchkey=%@ name=%@", mk, nm ?: @"(none)");
     return nm;
 }
@@ -472,6 +484,33 @@ static void gc_mc_showTC(id self, SEL _cmd, void *tc, BOOL animated) {
             if (nm.length) GCApplyTitle(vc, nm);
         }
     } @catch (__unused id e) {}
+}
+
+// Hook -[CKConversationListController tableView:cellForRowAtIndexPath:] so the
+// group name shows in the main Messages LIST too (CKConversationListCell is a
+// plain UITableViewCell, so its title is the standard textLabel).
+static id (*orig_clc_cell)(id, SEL, void *, void *);
+static id gc_clc_cell(id self, SEL _cmd, void *tableView, void *indexPath) {
+    id cell = orig_clc_cell(self, _cmd, tableView, indexPath);
+    @try {
+        id ip = GCIsObjectPtr(indexPath) ? (__bridge id)indexPath : nil;
+        if (cell && ip && [ip respondsToSelector:@selector(row)]) {
+            NSInteger row = ((NSInteger(*)(id, SEL))objc_msgSend)(ip, @selector(row));
+            id list = GCSend0(self, @selector(_conversationList));
+            id convs = GCSend0(list, @selector(conversations));
+            if ([convs respondsToSelector:@selector(count)] &&
+                row >= 0 && (NSUInteger)row < [(NSArray *)convs count]) {
+                id conv = [(NSArray *)convs objectAtIndex:row];
+                NSString *nm = GCTitleForConversation(conv);
+                if (nm.length) {
+                    id lbl = GCSend0(cell, @selector(textLabel));
+                    if (lbl && [lbl respondsToSelector:@selector(setText:)])
+                        ((void(*)(id, SEL, id))objc_msgSend)(lbl, @selector(setText:), nm);
+                }
+            }
+        }
+    } @catch (__unused id e) {}
+    return cell;
 }
 
 // ===========================================================================
@@ -544,6 +583,15 @@ static void GCBindUI(void) {
     if (GCDirectlyImplements(mc, showTC)) {
         MSHookMessageEx(mc, showTC, (IMP)gc_mc_showTC, (IMP *)&orig_mc_showTC);
         GCLog(@"HOOKED display -[CKMessagesController _showTranscriptController:animated:]");
+    }
+
+    Class clc = objc_getClass("CKConversationListController");
+    SEL cellSel = sel_getUid("tableView:cellForRowAtIndexPath:");
+    if (GCDirectlyImplements(clc, cellSel)) {
+        MSHookMessageEx(clc, cellSel, (IMP)gc_clc_cell, (IMP *)&orig_clc_cell);
+        GCLog(@"HOOKED display -[CKConversationListController tableView:cellForRowAtIndexPath:]");
+    } else {
+        GCLog(@"NOTE: CKConversationListController does not directly implement cellForRow (list not hooked)");
     }
 }
 

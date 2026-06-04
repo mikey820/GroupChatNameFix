@@ -1,6 +1,6 @@
 Package: com.mikey820.groupchatnamefix
 Name: GroupChatNameFix
-Version: 7.0.1
+Version: 7.1.0
 Architecture: iphoneos-arm
 Description: Fix iOS 6 group iMessages splitting into a new conversation after a newer-iOS device renames the group, and show the modern group's name in the Messages UI
 Maintainer: mikey820
