@@ -471,6 +471,11 @@ static void GCApplyTitle(id transcriptVC, NSString *name) {
     } @catch (__unused id e) {}
 }
 
+// NB: iOS 6 REUSES one CKTranscriptController across chats - so every hook must
+// recompute the title from the CURRENT conversation and only override when it
+// resolves to a learned group name. Caching a name on the controller would leak
+// it onto the next (unrelated) chat the controller is reused for.
+
 // Hook -[CKTranscriptController setConversation:]
 static void (*orig_tc_setConv)(id, SEL, void *);
 static void gc_tc_setConv(id self, SEL _cmd, void *conv) {
@@ -478,11 +483,7 @@ static void gc_tc_setConv(id self, SEL _cmd, void *conv) {
     @try {
         id c = GCIsObjectPtr(conv) ? (__bridge id)conv : nil;
         NSString *nm = GCTitleForConversation(c);
-        if (nm) {
-            // hold onto it so viewWillAppear: can re-assert after the OS recomputes
-            objc_setAssociatedObject(self, (void *)&orig_tc_setConv, nm, OBJC_ASSOCIATION_RETAIN_NONATOMIC);
-            GCApplyTitle(self, nm);
-        }
+        if (nm.length) GCApplyTitle(self, nm);
     } @catch (__unused id e) {}
 }
 
@@ -494,11 +495,7 @@ static void (*orig_tc_vwa)(id, SEL, BOOL);
 static void gc_tc_vwa(id self, SEL _cmd, BOOL animated) {
     orig_tc_vwa(self, _cmd, animated);
     @try {
-        NSString *nm = objc_getAssociatedObject(self, (void *)&orig_tc_setConv);
-        if (![nm isKindOfClass:[NSString class]] || !nm.length) {
-            id conv = GCSend0(self, @selector(conversation));
-            nm = GCTitleForConversation(conv);
-        }
+        NSString *nm = GCTitleForConversation(GCSend0(self, @selector(conversation)));
         if (nm.length) GCApplyTitle(self, nm);
     } @catch (__unused id e) {}
 }
@@ -536,8 +533,10 @@ static id gc_clc_cell(id self, SEL _cmd, void *tableView, void *indexPath) {
                 NSString *nm = GCTitleForConversation(conv);
                 if (nm.length) {
                     id lbl = GCSend0(cell, @selector(textLabel));
-                    if (lbl && [lbl respondsToSelector:@selector(setText:)])
+                    if (lbl && [lbl respondsToSelector:@selector(setText:)]) {
                         ((void(*)(id, SEL, id))objc_msgSend)(lbl, @selector(setText:), nm);
+                        GCLOGB(@"LIST row=%ld -> %@", (long)row, nm);
+                    }
                 }
             }
         }
@@ -647,7 +646,7 @@ static void GCImageAdded(const struct mach_header *mh, intptr_t slide) {
     @autoreleasepool {
         gIsUI = GCInMobileSMS();
         GCBuildClassList();
-        GCLog(@"=== GroupChatNameFix 7.1.2 loaded in %s (classes=%d) ===",
+        GCLog(@"=== GroupChatNameFix 7.1.3 loaded in %s (classes=%d) ===",
               gIsUI ? "MobileSMS[display]" : "imagent[routing]", gClassCount);
         GCTryBind();
         if (!GCAllBound()) {
