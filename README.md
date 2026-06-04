@@ -70,10 +70,13 @@ end‑to‑end payload as the `gid`. So the tweak now also:
    tableView:cellForRowAtIndexPath:]`).
 
 The routing and display halves are joined by a scheme/format‑insensitive participant key.
-Because `imagent`'s participant list includes the device's **own** handle but `ChatKit`'s
-recipient list does not, the harvest side strips the device's own iMessage handles (looked
-up from `IMCore`) before building the key, so both sides agree on an exact match. Display
-is cosmetic and entirely on the iOS 6 device — no protocol effect.
+`imagent`'s participant list includes the device's **own** handle while `ChatKit`'s
+recipient list does not — and the account aliases aren't readable from inside the
+`imagent` daemon (its `IMAccountController` is an empty client proxy). So `imagent` stores
+the key with self included, and the **`MobileSMS`** side — where the account aliases *are*
+available — reconciles at lookup time: it tries the on‑screen recipients, then retries with
+each of the device's own handles added, matching the stored key exactly. Display is
+cosmetic and entirely on the iOS 6 device — no protocol effect.
 
 ## Install
 

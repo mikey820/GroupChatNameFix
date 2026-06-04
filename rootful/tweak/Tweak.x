@@ -442,9 +442,20 @@ static NSString *GCTitleForConversation(id conv) {
     }
     NSString *forced = GCForceName();
     if (forced) { GCLOGB(@"UI force-name -> %@", forced); return forced; }
-    NSString *mk = GCMatchKeyEx(addrs, YES);   // drop self too, in case ChatKit ever includes it
-    NSString *nm = GCLookupName(mk);
-    GCLOGB(@"UI conv matchkey=%@ name=%@", mk, nm ?: @"(none)");
+    // The on-screen recipients exclude self, but imagent (the daemon) can't read
+    // the account aliases, so it stores the key WITH self. Try the bare key, then
+    // retry with each of our own handles added - exact set match either way.
+    NSString *base = GCMatchKeyEx(addrs, YES);
+    NSString *nm = GCLookupName(base);
+    NSString *hit = base;
+    if (!nm) {
+        for (NSString *h in GCSelfHandles()) {
+            NSString *k = GCMatchKeyEx([addrs arrayByAddingObject:h], NO);
+            NSString *r = GCLookupName(k);
+            if (r) { nm = r; hit = k; break; }
+        }
+    }
+    GCLOGB(@"UI conv key=%@ name=%@", hit, nm ?: @"(none)");
     return nm;
 }
 
@@ -636,7 +647,7 @@ static void GCImageAdded(const struct mach_header *mh, intptr_t slide) {
     @autoreleasepool {
         gIsUI = GCInMobileSMS();
         GCBuildClassList();
-        GCLog(@"=== GroupChatNameFix 7.1.1 loaded in %s (classes=%d) ===",
+        GCLog(@"=== GroupChatNameFix 7.1.2 loaded in %s (classes=%d) ===",
               gIsUI ? "MobileSMS[display]" : "imagent[routing]", gClassCount);
         GCTryBind();
         if (!GCAllBound()) {
