@@ -336,13 +336,6 @@ static void *gc_JWDecode(void *data) {
                 if ([gid isKindOfClass:[NSString class]] && p) {
                     NSString *key = GCPKey(p);
                     if (key) GCStoreGid(key, (NSString *)gid);
-                    // probe: show the shape of gid-bearing payloads while we learn names
-                    GCLOGB(@"DECODE gid-dict keys=%@", [[d allKeys] componentsJoinedByString:@","]);
-                    static int gPV = 12;   // a few full p/r dumps to identify "self"
-                    if (gPV-- > 0) {
-                        id rr = [d objectForKey:@"r"];
-                        GCLog(@"DECODE p=%@ r=%@", [p description], rr ? [rr description] : @"(nil)");
-                    }
                     NSString *nm = GCExtractName(d);
                     if (nm) {
                         NSString *mk = GCMatchKeyEx(p, YES);   // drop self so the key matches the UI side
@@ -435,27 +428,21 @@ static NSString *GCForceName(void) {
 // Resolve the display name to use for a transcript controller's conversation.
 static NSString *GCTitleForConversation(id conv) {
     NSArray *addrs = GCConversationAddresses(conv);
-    if (addrs.count < 2) {                       // 1:1 chats are left untouched
-        if (addrs.count) GCLOGB(@"UI conv addrs=%@ (not a group, skip)",
-                                [addrs componentsJoinedByString:@","]);
-        return nil;
-    }
+    if (addrs.count < 2) return nil;             // 1:1 chats are left untouched
     NSString *forced = GCForceName();
-    if (forced) { GCLOGB(@"UI force-name -> %@", forced); return forced; }
+    if (forced) return forced;
     // The on-screen recipients exclude self, but imagent (the daemon) can't read
     // the account aliases, so it stores the key WITH self. Try the bare key, then
     // retry with each of our own handles added - exact set match either way.
     NSString *base = GCMatchKeyEx(addrs, YES);
     NSString *nm = GCLookupName(base);
-    NSString *hit = base;
     if (!nm) {
         for (NSString *h in GCSelfHandles()) {
-            NSString *k = GCMatchKeyEx([addrs arrayByAddingObject:h], NO);
-            NSString *r = GCLookupName(k);
-            if (r) { nm = r; hit = k; break; }
+            NSString *r = GCLookupName(GCMatchKeyEx([addrs arrayByAddingObject:h], NO));
+            if (r) { nm = r; break; }
         }
     }
-    GCLOGB(@"UI conv key=%@ name=%@", hit, nm ?: @"(none)");
+    if (nm.length) GCLOGB(@"UI matched group name=%@", nm);
     return nm;
 }
 
@@ -535,9 +522,6 @@ static id gc_clc_cell(id self, SEL _cmd, void *tableView, void *indexPath) {
             id convs = GCSend0(shared, @selector(activeConversations));
             if (![convs respondsToSelector:@selector(count)]) convs = GCSend0(shared, @selector(conversations));
             NSUInteger n = [convs respondsToSelector:@selector(count)] ? [(NSArray *)convs count] : 0;
-            static int gLD = 10;
-            if (gLD-- > 0) GCLog(@"LIST probe row=%ld shared=%@ convs=%lu",
-                                 (long)row, shared ? @"y" : @"nil", (unsigned long)n);
             if (row >= 0 && (NSUInteger)row < n) {
                 id conv = [(NSArray *)convs objectAtIndex:row];
                 NSString *nm = GCTitleForConversation(conv);
@@ -661,7 +645,7 @@ static void GCImageAdded(const struct mach_header *mh, intptr_t slide) {
     @autoreleasepool {
         gIsUI = GCInMobileSMS();
         GCBuildClassList();
-        GCLog(@"=== GroupChatNameFix 7.1.6 loaded in %s (classes=%d) ===",
+        GCLog(@"=== GroupChatNameFix 7.2.0 loaded in %s (classes=%d) ===",
               gIsUI ? "MobileSMS[display]" : "imagent[routing]", gClassCount);
         GCTryBind();
         if (!GCAllBound()) {
