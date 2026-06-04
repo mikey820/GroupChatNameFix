@@ -170,31 +170,47 @@ static NSString *GCNormAddr(NSString *s) {
 // not - stripping self makes the two sides produce the SAME key (exact match,
 // no fuzzy subset guessing). Fetched lazily from IMCore; never cached empty.
 static NSSet *gSelfSet = nil;
+// Add one address (string OR an IMHandle object) to the self set, normalized.
+static void GCAddSelf(NSMutableSet *s, id v) {
+    if ([v isKindOfClass:[NSString class]]) {
+        NSString *n = GCNormAddr((NSString *)v);
+        if (n.length) [s addObject:n];
+    } else if (GCIsObjectPtr((__bridge const void *)v)) {
+        id idstr = GCSend0(v, @selector(ID));
+        if (![idstr isKindOfClass:[NSString class]]) idstr = GCSend0(v, @selector(normalizedID));
+        NSString *n = GCNormAddr([idstr isKindOfClass:[NSString class]] ? idstr : nil);
+        if (n.length) [s addObject:n];
+    }
+}
+// The device's OWN iMessage aliases (NOT the roster). arrayOfAllIMHandles
+// returns everyone the account knows, so we use the account's own
+// aliases/vettedAliases/loginIMHandle instead.
 static NSSet *GCSelfHandles(void) {
     if (gSelfSet) return gSelfSet;
     NSMutableSet *s = [NSMutableSet set];
+    int naccts = 0;
     @try {
         Class cc = objc_getClass("IMAccountController");
         if (cc && [cc respondsToSelector:@selector(sharedInstance)]) {
             id ctrl = ((id(*)(id, SEL))objc_msgSend)((id)cc, @selector(sharedInstance));
-            id accts = GCSend0(ctrl, @selector(connectedAccounts));
-            if (![accts respondsToSelector:@selector(count)]) accts = GCSend0(ctrl, @selector(accounts));
+            id accts = GCSend0(ctrl, @selector(accounts));
+            if (![accts respondsToSelector:@selector(count)] || [(NSArray *)accts count] == 0)
+                accts = GCSend0(ctrl, @selector(connectedAccounts));
             if ([accts respondsToSelector:@selector(count)]) {
                 for (id acct in (NSArray *)accts) {
-                    id handles = GCSend0(acct, @selector(arrayOfAllIMHandles));
-                    if ([handles respondsToSelector:@selector(count)]) {
-                        for (id h in (NSArray *)handles) {
-                            id idstr = GCSend0(h, @selector(ID));
-                            if (![idstr isKindOfClass:[NSString class]]) idstr = GCSend0(h, @selector(normalizedID));
-                            NSString *n = GCNormAddr([idstr isKindOfClass:[NSString class]] ? idstr : nil);
-                            if (n.length) [s addObject:n];
-                        }
-                    }
+                    naccts++;
+                    id al = GCSend0(acct, @selector(aliases));
+                    if ([al respondsToSelector:@selector(count)]) for (id v in (NSArray *)al) GCAddSelf(s, v);
+                    id va = GCSend0(acct, @selector(vettedAliases));
+                    if ([va respondsToSelector:@selector(count)]) for (id v in (NSArray *)va) GCAddSelf(s, v);
+                    GCAddSelf(s, GCSend0(acct, @selector(loginIMHandle)));
                 }
             }
         }
     } @catch (__unused id e) {}
-    if (s.count) { gSelfSet = [s copy]; GCLOGB(@"SELF handles=%@", [[gSelfSet allObjects] componentsJoinedByString:@","]); }
+    GCLOGB(@"SELF accounts=%d handles=%@", naccts,
+           s.count ? [[s allObjects] componentsJoinedByString:@","] : @"(none)");
+    if (s.count) { gSelfSet = [s copy]; }
     return s.count ? gSelfSet : s;
 }
 
@@ -322,6 +338,11 @@ static void *gc_JWDecode(void *data) {
                     if (key) GCStoreGid(key, (NSString *)gid);
                     // probe: show the shape of gid-bearing payloads while we learn names
                     GCLOGB(@"DECODE gid-dict keys=%@", [[d allKeys] componentsJoinedByString:@","]);
+                    static int gPV = 12;   // a few full p/r dumps to identify "self"
+                    if (gPV-- > 0) {
+                        id rr = [d objectForKey:@"r"];
+                        GCLog(@"DECODE p=%@ r=%@", [p description], rr ? [rr description] : @"(nil)");
+                    }
                     NSString *nm = GCExtractName(d);
                     if (nm) {
                         NSString *mk = GCMatchKeyEx(p, YES);   // drop self so the key matches the UI side
@@ -615,7 +636,7 @@ static void GCImageAdded(const struct mach_header *mh, intptr_t slide) {
     @autoreleasepool {
         gIsUI = GCInMobileSMS();
         GCBuildClassList();
-        GCLog(@"=== GroupChatNameFix 7.0.0 loaded in %s (classes=%d) ===",
+        GCLog(@"=== GroupChatNameFix 7.1.1 loaded in %s (classes=%d) ===",
               gIsUI ? "MobileSMS[display]" : "imagent[routing]", gClassCount);
         GCTryBind();
         if (!GCAllBound()) {
