@@ -542,7 +542,12 @@ static id gc_clc_cell(id self, SEL _cmd, void *tableView, void *indexPath) {
                 id conv = [(NSArray *)convs objectAtIndex:row];
                 NSString *nm = GCTitleForConversation(conv);
                 if (nm.length) {
-                    id lbl = GCSend0(cell, @selector(textLabel));
+                    // The conversation name is shown in the cell's _fromLabel
+                    // (UILabel), NOT the standard textLabel.
+                    id lbl = nil;
+                    @try { lbl = [cell valueForKey:@"fromLabel"]; } @catch (__unused id e) {}
+                    if (![lbl respondsToSelector:@selector(setText:)])
+                        lbl = GCSend0(cell, @selector(textLabel));
                     if (lbl && [lbl respondsToSelector:@selector(setText:)]) {
                         ((void(*)(id, SEL, id))objc_msgSend)(lbl, @selector(setText:), nm);
                         GCLOGB(@"LIST row=%ld -> %@", (long)row, nm);
@@ -656,7 +661,7 @@ static void GCImageAdded(const struct mach_header *mh, intptr_t slide) {
     @autoreleasepool {
         gIsUI = GCInMobileSMS();
         GCBuildClassList();
-        GCLog(@"=== GroupChatNameFix 7.1.5 loaded in %s (classes=%d) ===",
+        GCLog(@"=== GroupChatNameFix 7.1.6 loaded in %s (classes=%d) ===",
               gIsUI ? "MobileSMS[display]" : "imagent[routing]", gClassCount);
         GCTryBind();
         if (!GCAllBound()) {
