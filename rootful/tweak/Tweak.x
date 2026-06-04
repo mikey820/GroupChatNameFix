@@ -525,14 +525,20 @@ static id gc_clc_cell(id self, SEL _cmd, void *tableView, void *indexPath) {
         id ip = GCIsObjectPtr(indexPath) ? (__bridge id)indexPath : nil;
         if (cell && ip && [ip respondsToSelector:@selector(row)]) {
             NSInteger row = ((NSInteger(*)(id, SEL))objc_msgSend)(ip, @selector(row));
-            id list = GCSend0(self, @selector(_conversationList));
-            id convs = GCSend0(list, @selector(conversations));
-            NSUInteger n = [convs respondsToSelector:@selector(count)] ? [(NSArray *)convs count] : 999999;
-            static int gLD = 8;
-            if (gLD-- > 0) GCLog(@"LIST probe row=%ld list=%@ convs=%@ count=%lu",
-                                 (long)row, list ? @"y" : @"nil", convs ? @"y" : @"nil", (unsigned long)n);
-            if ([convs respondsToSelector:@selector(count)] &&
-                row >= 0 && (NSUInteger)row < n) {
+            // The controller's own _conversationList is nil at render; the data
+            // is the CKConversationList singleton.
+            id shared = nil;
+            Class clcl = objc_getClass("CKConversationList");
+            if (clcl && [clcl respondsToSelector:@selector(sharedConversationList)])
+                shared = ((id(*)(id, SEL))objc_msgSend)((id)clcl, @selector(sharedConversationList));
+            if (!shared) shared = GCSend0(self, @selector(_conversationList));
+            id convs = GCSend0(shared, @selector(activeConversations));
+            if (![convs respondsToSelector:@selector(count)]) convs = GCSend0(shared, @selector(conversations));
+            NSUInteger n = [convs respondsToSelector:@selector(count)] ? [(NSArray *)convs count] : 0;
+            static int gLD = 10;
+            if (gLD-- > 0) GCLog(@"LIST probe row=%ld shared=%@ convs=%lu",
+                                 (long)row, shared ? @"y" : @"nil", (unsigned long)n);
+            if (row >= 0 && (NSUInteger)row < n) {
                 id conv = [(NSArray *)convs objectAtIndex:row];
                 NSString *nm = GCTitleForConversation(conv);
                 if (nm.length) {
@@ -650,7 +656,7 @@ static void GCImageAdded(const struct mach_header *mh, intptr_t slide) {
     @autoreleasepool {
         gIsUI = GCInMobileSMS();
         GCBuildClassList();
-        GCLog(@"=== GroupChatNameFix 7.1.4 loaded in %s (classes=%d) ===",
+        GCLog(@"=== GroupChatNameFix 7.1.5 loaded in %s (classes=%d) ===",
               gIsUI ? "MobileSMS[display]" : "imagent[routing]", gClassCount);
         GCTryBind();
         if (!GCAllBound()) {
