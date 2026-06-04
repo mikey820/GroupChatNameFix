@@ -1,4 +1,4 @@
-// GroupChatNameFix - iOS 6 (armv7s) tweak for imagent / iMessage.imservice + MobileSMS.
+﻿// GroupChatNameFix - iOS 6 (armv7s) tweak for imagent / iMessage.imservice + MobileSMS.
 //
 // v7.0.0 - now ALSO shows the modern group's NAME in the iOS 6 Messages UI.
 // -----------------------------------------------------------------------------
@@ -527,8 +527,12 @@ static id gc_clc_cell(id self, SEL _cmd, void *tableView, void *indexPath) {
             NSInteger row = ((NSInteger(*)(id, SEL))objc_msgSend)(ip, @selector(row));
             id list = GCSend0(self, @selector(_conversationList));
             id convs = GCSend0(list, @selector(conversations));
+            NSUInteger n = [convs respondsToSelector:@selector(count)] ? [(NSArray *)convs count] : 999999;
+            static int gLD = 8;
+            if (gLD-- > 0) GCLog(@"LIST probe row=%ld list=%@ convs=%@ count=%lu",
+                                 (long)row, list ? @"y" : @"nil", convs ? @"y" : @"nil", (unsigned long)n);
             if ([convs respondsToSelector:@selector(count)] &&
-                row >= 0 && (NSUInteger)row < [(NSArray *)convs count]) {
+                row >= 0 && (NSUInteger)row < n) {
                 id conv = [(NSArray *)convs objectAtIndex:row];
                 NSString *nm = GCTitleForConversation(conv);
                 if (nm.length) {
@@ -646,7 +650,7 @@ static void GCImageAdded(const struct mach_header *mh, intptr_t slide) {
     @autoreleasepool {
         gIsUI = GCInMobileSMS();
         GCBuildClassList();
-        GCLog(@"=== GroupChatNameFix 7.1.3 loaded in %s (classes=%d) ===",
+        GCLog(@"=== GroupChatNameFix 7.1.4 loaded in %s (classes=%d) ===",
               gIsUI ? "MobileSMS[display]" : "imagent[routing]", gClassCount);
         GCTryBind();
         if (!GCAllBound()) {
