@@ -1,4 +1,4 @@
-﻿// GroupChatNameFix - iOS 6 (armv7s) tweak for imagent / iMessage.imservice + MobileSMS.
+// GroupChatNameFix - iOS 6 (armv7s) tweak for imagent / iMessage.imservice + MobileSMS.
 //
 // v7.0.0 - now ALSO shows the modern group's NAME in the iOS 6 Messages UI.
 // -----------------------------------------------------------------------------
