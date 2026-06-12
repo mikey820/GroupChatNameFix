@@ -25,6 +25,7 @@ Supports:
 Please double-check that you're sending on the **Base** network.
 
 Thank you for your support!
+
 ---
 
 ## The bug
