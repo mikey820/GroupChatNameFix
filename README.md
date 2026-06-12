@@ -14,15 +14,11 @@ group name** in the iOS 6 Messages app instead of the bare participant list.
 
 If you find this project useful and would like to support development, donations are appreciated.
 
-### Base (Recommended)
-**Network:** Base  
-**Address:** `0x3a938bebeaFEbE057F13e4B14d250CBdcEb68B43`
+### Litecoin
+**Network:** Litecoin (LTC)  
+**Address:** `ltc1qaz2zqcc5usl4ueg7w5m8kqcmvrfqurpn6wqyfa`
 
-Supports:
-- ETH (Base)
-- USDC (Base)
-
-Please double-check that you're sending on the **Base** network.
+Please double-check that you're sending on the **Litecoin** network.
 
 Thank you for your support!
 
