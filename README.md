@@ -10,6 +10,21 @@ group name** in the iOS 6 Messages app instead of the bare participant list.
 > the other members. This tweak makes those messages thread into the real named group
 > again. It is **fully autonomous**, no companion app, no manual configuration.
 
+## ❤️ Support the Project
+
+If you find this project useful and would like to support development, donations are appreciated.
+
+### Base (Recommended)
+**Network:** Base  
+**Address:** `0x3a938bebeaFEbE057F13e4B14d250CBdcEb68B43`
+
+Supports:
+- ETH (Base)
+- USDC (Base)
+
+Please double-check that you're sending on the **Base** network.
+
+Thank you for your support!
 ---
 
 ## The bug
